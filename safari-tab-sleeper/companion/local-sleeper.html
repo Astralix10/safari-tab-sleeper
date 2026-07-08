@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Спящая вкладка</title>
+  <link id="favicon" rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23f2f5f4'/%3E%3Cpath d='M10 11h12l-9 10h9' fill='none' stroke='%2364706d' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <style>
+    :root {
+      color-scheme: light;
+      --accent: #0d8f7f;
+      --accent-strong: #06695e;
+      --bg: #f5faf8;
+      --panel: #ffffff;
+      --text: #17211f;
+      --muted: #64706d;
+      --border: #dce5e2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background: var(--bg);
+    }
+    main {
+      width: min(620px, 100%);
+      padding: 28px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--accent-strong);
+      font-weight: 740;
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(28px, 5vw, 44px);
+      line-height: 1.08;
+    }
+    p {
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+    button, a {
+      display: inline-flex;
+      align-items: center;
+      min-height: 40px;
+      margin-top: 12px;
+      border-radius: 8px;
+      padding: 9px 14px;
+      font: inherit;
+      font-weight: 700;
+    }
+    button {
+      border: 1px solid var(--accent);
+      color: white;
+      background: var(--accent);
+      cursor: pointer;
+    }
+    a {
+      color: var(--accent-strong);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">Safari Tab Sleeper Companion</p>
+    <h1 id="title">Вкладка выгружена.</h1>
+    <p id="url">Исходная страница больше не работает.</p>
+    <button id="restore" type="button">Восстановить вкладку</button>
+    <a id="direct" href="#" hidden>Открыть исходный URL</a>
+  </main>
+  <script>
+    const hash = new URLSearchParams(location.hash.slice(1));
+    const originalUrl = hash.get('url') || '';
+    const originalTitle = hash.get('title') || 'Спящая вкладка';
+    const reason = hash.get('reason') || 'sleep';
+    const title = document.querySelector('#title');
+    const url = document.querySelector('#url');
+    const restore = document.querySelector('#restore');
+    const direct = document.querySelector('#direct');
+    const favicon = document.querySelector('#favicon');
+    let wasHiddenAfterSleep = document.visibilityState === 'hidden' || hash.get('auto') === '1';
+
+    function getSleepReasonTag(reason) {
+      const tags = {
+        memory: 'memory',
+        manual: 'manual',
+        idle: 'idle',
+        youtube: 'youtube'
+      };
+      return tags[reason] || 'sleep';
+    }
+
+    function formatSleepingTabTitle(title, reason) {
+      const trimmed = String(title || '').trim() || 'Спящая вкладка';
+      const cleanTitle = trimmed.replace(/^\[(?:sleep|спит)(?::[^\]]+)?\]\s*/i, '').trim() || 'Спящая вкладка';
+      const tag = getSleepReasonTag(reason);
+      return tag === 'sleep' ? `[sleep] ${cleanTitle}` : `[sleep: ${tag}] ${cleanTitle}`;
+    }
+
+    function getSleepingTabIconUrl(pageUrl) {
+      try {
+        const parsed = new URL(normalizeRestorableUrl(pageUrl) || pageUrl);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          return '';
+        }
+        return `${parsed.origin}/favicon.ico`;
+      } catch {
+        return '';
+      }
+    }
+
+    function decodeURIComponentSafely(value) {
+      try {
+        return decodeURIComponent(value);
+      } catch {
+        return value;
+      }
+    }
+
+    function normalizeRestorableUrl(value) {
+      const candidates = [];
+      const add = (candidate) => {
+        const text = String(candidate || '').trim();
+        if (text && !candidates.includes(text)) {
+          candidates.push(text);
+        }
+      };
+
+      add(value);
+      let decoded = String(value || '').trim();
+      for (let i = 0; i < 3; i += 1) {
+        const next = decodeURIComponentSafely(decoded);
+        if (next === decoded) break;
+        decoded = next;
+        add(decoded);
+      }
+
+      for (const candidate of [...candidates]) {
+        try {
+          const parsed = new URL(candidate);
+          for (const key of ['url', 'u', 'target']) {
+            add(parsed.searchParams.get(key));
+          }
+        } catch {}
+
+        for (const match of candidate.match(/https?:\/\/[^\s"'<>]+/gi) || []) {
+          add(match.replace(/[),.;]+$/, ''));
+        }
+      }
+
+      for (const candidate of candidates) {
+        try {
+          const parsed = new URL(candidate);
+          if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+            return parsed.toString();
+          }
+        } catch {}
+      }
+
+      return '';
+    }
+
+    const restorableUrl = normalizeRestorableUrl(originalUrl);
+    document.title = formatSleepingTabTitle(originalTitle, reason);
+    const iconUrl = getSleepingTabIconUrl(restorableUrl || originalUrl);
+    if (iconUrl) {
+      favicon.href = iconUrl;
+    }
+    title.textContent = originalTitle;
+    url.textContent = restorableUrl ? `Исходный URL: ${restorableUrl}` : 'Исходный URL не передан.';
+    restore.disabled = !restorableUrl;
+    direct.hidden = !restorableUrl;
+    direct.href = restorableUrl || '#';
+
+    function restoreNow() {
+      if (restorableUrl) {
+        location.replace(restorableUrl);
+      }
+    }
+
+    restore.addEventListener('click', restoreNow);
+
+    function scheduleRestoreOnReturn() {
+      if (wasHiddenAfterSleep && restorableUrl && document.visibilityState === 'visible') {
+        window.setTimeout(() => {
+          restoreNow();
+        }, 150);
+      }
+    }
+
+    window.addEventListener('focus', scheduleRestoreOnReturn);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        wasHiddenAfterSleep = true;
+        return;
+      }
+
+      scheduleRestoreOnReturn();
+    });
+    scheduleRestoreOnReturn();
+  </script>
+</body>
+</html>

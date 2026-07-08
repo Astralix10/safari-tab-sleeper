@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Safari Tab Sleeper</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="popup">
+    <header class="header">
+      <div>
+        <p class="eyebrow">Safari Tab Sleeper</p>
+        <h1 id="status-title">Загрузка...</h1>
+      </div>
+      <span id="badge" class="badge" hidden></span>
+    </header>
+
+    <section class="status">
+      <p id="tab-title" class="tab-title"></p>
+      <p id="tab-meta" class="muted"></p>
+    </section>
+
+    <section class="controls" aria-label="Профиль усыпления">
+      <label>
+        Профиль
+        <select id="profile">
+          <option value="safe">Бережный</option>
+          <option value="balanced">Баланс</option>
+          <option value="aggressive">Агрессивный</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="actions" aria-label="Действия со вкладками">
+      <button id="sleep-current" class="primary" type="button">Усыпить текущую вкладку</button>
+      <button id="restore-current" type="button" hidden>Восстановить вкладку</button>
+      <button id="sleep-all-except-current" type="button">Усыпить все, кроме текущей</button>
+      <button id="restore-all" type="button">Разбудить все вкладки</button>
+      <button id="sleep-youtube" type="button">Усыпить тяжёлые фоновые вкладки</button>
+      <button id="free-memory-now" class="primary" type="button">Освободить память сейчас</button>
+      <div class="allowlist-row">
+        <button id="allowlist-toggle" class="switch-button" type="button" role="switch" aria-checked="false">
+          <span class="switch-track" aria-hidden="true">
+            <span class="switch-thumb"></span>
+          </span>
+          <span class="switch-label">Не усыплять сайт</span>
+        </button>
+      </div>
+      <button id="reset-youtube" type="button">Сбросить счётчик YouTube</button>
+    </section>
+
+    <section class="memory-panel" aria-label="Память Safari">
+      <div class="memory-card">
+        <p class="memory-label">Память Safari/WebKit</p>
+        <p id="memory-usage" class="memory-value">Загрузка...</p>
+        <p id="memory-details" class="memory-details">Companion-монитор проверяет Safari.</p>
+        <p id="power-status" class="memory-details">Питание: проверяется.</p>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <button id="open-options" class="link-button" type="button">Настройки</button>
+      <span>Оповещения по RAM живут в companion-мониторе.</span>
+    </footer>
+  </main>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

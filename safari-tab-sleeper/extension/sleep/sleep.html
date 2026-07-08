@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Спящая вкладка</title>
+  <link id="favicon" rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23f2f5f4'/%3E%3Cpath d='M10 11h12l-9 10h9' fill='none' stroke='%2364706d' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <script src="early-favicon.js"></script>
+  <link rel="stylesheet" href="sleep.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="panel">
+      <p class="eyebrow">Вкладка спит</p>
+      <h1 id="title">Вкладка выгружена.</h1>
+      <p id="details" class="details">Исходная страница больше не работает в этой вкладке.</p>
+      <div class="actions">
+        <button id="restore" class="primary" type="button">Восстановить вкладку</button>
+        <a id="direct-link" href="#" hidden>Открыть исходный URL</a>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="sleep.js"></script>
+</body>
+</html>

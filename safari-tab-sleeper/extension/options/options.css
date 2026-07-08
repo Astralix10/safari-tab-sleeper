@@ -1,0 +1,120 @@
+:root {
+  color-scheme: light;
+  --accent: #0d8f7f;
+  --accent-strong: #06695e;
+  --bg: #f7faf8;
+  --panel: #ffffff;
+  --text: #17211f;
+  --muted: #64706d;
+  --border: #dce5e2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+
+.page {
+  width: min(760px, calc(100vw - 32px));
+  margin: 32px auto;
+}
+
+.eyebrow {
+  margin: 0 0 4px;
+  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+h1 {
+  margin: 0 0 24px;
+  font-size: 32px;
+  line-height: 1.15;
+}
+
+h2 {
+  margin: 0 0 14px;
+  font-size: 18px;
+}
+
+section {
+  margin-bottom: 18px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+  font-weight: 650;
+}
+
+label.check {
+  grid-template-columns: 18px 1fr;
+  align-items: center;
+  font-weight: 520;
+}
+
+input,
+select,
+textarea,
+button {
+  font: inherit;
+}
+
+input[type="number"],
+select,
+textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 10px;
+  color: var(--text);
+  background: #fff;
+}
+
+textarea {
+  resize: vertical;
+}
+
+.hint {
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+button {
+  min-height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 14px;
+  color: var(--text);
+  background: var(--panel);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button.primary {
+  color: white;
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+#save-status {
+  color: var(--muted);
+}

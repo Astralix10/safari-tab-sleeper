@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Настройки Safari Tab Sleeper</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main class="page">
+    <header>
+      <p class="eyebrow">Safari Tab Sleeper</p>
+      <h1>Настройки</h1>
+    </header>
+
+    <form id="settings-form">
+      <section>
+        <h2>Усыпление</h2>
+        <label>
+          Профиль
+          <select name="profile">
+            <option value="safe">Бережный: ждёт дольше</option>
+            <option value="balanced">Баланс: 5 минут по умолчанию</option>
+            <option value="aggressive">Агрессивный: самая быстрая очистка</option>
+          </select>
+        </label>
+        <label>
+          Таймер неактивности, минуты
+          <input name="inactivityMinutes" type="number" min="1" max="180" step="1">
+        </label>
+        <label class="check">
+          <input name="restoreOnFocus" type="checkbox">
+          Восстанавливать спящие вкладки при выборе
+        </label>
+        <label class="check">
+          <input name="powerAware" type="checkbox">
+          На батарее усыплять быстрее, на зарядке мягче
+        </label>
+        <label class="check">
+          <input name="requireLocalSleepServer" type="checkbox">
+          Не усыплять вкладки, если локальный sleep-server недоступен
+        </label>
+        <label class="check">
+          <input name="skipPinned" type="checkbox">
+          Не усыплять закреплённые вкладки
+        </label>
+        <label class="check">
+          <input name="skipAudible" type="checkbox">
+          Не усыплять вкладки со звуком
+        </label>
+        <label class="check">
+          <input name="protectDirtyForms" type="checkbox">
+          Защищать вкладки с заполненными формами
+        </label>
+      </section>
+
+      <section>
+        <h2>Очистка тяжёлых вкладок</h2>
+        <label>
+          Сколько YouTube-видео считать риском
+          <input name="youtubeVideoThreshold" type="number" min="2" max="500" step="1">
+        </label>
+        <label>
+          Таймер рискованной YouTube-вкладки, секунды
+          <input name="youtubeHighRiskInactiveSeconds" type="number" min="10" max="1800" step="10">
+        </label>
+        <label>
+          Таймер быстрых доменов, секунды
+          <input name="aggressiveInactiveSeconds" type="number" min="10" max="1800" step="10">
+        </label>
+      </section>
+
+      <section>
+        <h2>Никогда не усыплять эти домены</h2>
+        <textarea name="allowlist" rows="7" spellcheck="false" placeholder="app.example.com&#10;*.internal.test"></textarea>
+        <p class="hint">Один домен на строку. Маска вроде *.example.com поддерживается.</p>
+      </section>
+
+      <section>
+        <h2>Усыплять эти домены быстрее</h2>
+        <textarea name="aggressiveList" rows="6" spellcheck="false" placeholder="youtube.com&#10;*.heavy-app.test"></textarea>
+        <p class="hint">Эти домены используют быстрый таймер даже в бережном или сбалансированном профиле.</p>
+      </section>
+
+      <section>
+        <h2>Тяжёлые домены при давлении на память</h2>
+        <textarea name="pressureDomains" rows="9" spellcheck="false"></textarea>
+        <p class="hint">Используется кнопкой «Усыпить тяжёлые фоновые вкладки» и companion-монитором памяти.</p>
+      </section>
+
+      <div class="bar">
+        <button class="primary" type="submit">Сохранить настройки</button>
+        <button id="restore-defaults" type="button">Вернуть по умолчанию</button>
+        <span id="save-status" role="status"></span>
+      </div>
+    </form>
+  </main>
+
+  <script type="module" src="options.js"></script>
+</body>
+</html>

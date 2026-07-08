@@ -1,0 +1,22 @@
+.DS_Store
+*.zip
+
+# Xcode / Swift build products
+DerivedData*/
+**/DerivedData*/
+**/.build/
+*.xcuserstate
+xcuserdata/
+*.dSYM/
+
+# Node / local caches
+node_modules/
+.npm/
+__pycache__/
+*.pyc
+
+# Local runtime files
+sleep-archive.json
+pause-until
+*.log
+*.err.log
