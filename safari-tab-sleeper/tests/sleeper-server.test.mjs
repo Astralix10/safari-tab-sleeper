@@ -159,8 +159,30 @@ test('sleep server syncs extension allowlist for companion AppleScript cleanup',
 
     const body = await response.json();
     assert.equal(body.ready, true);
-    assert.deepEqual(body.allowlist, ['www.youtube.com', '*.example.com']);
-    assert.equal(await readFile(allowlistPath, 'utf8'), 'www.youtube.com\n*.example.com\n');
+    assert.deepEqual(body.allowlist, [
+      'www.youtube.com',
+      'youtube.com',
+      '*.youtube.com',
+      'youtu.be',
+      '*.youtu.be',
+      'youtube-nocookie.com',
+      '*.youtube-nocookie.com',
+      '*.example.com',
+    ]);
+    assert.equal(
+      await readFile(allowlistPath, 'utf8'),
+      [
+        'www.youtube.com',
+        'youtube.com',
+        '*.youtube.com',
+        'youtu.be',
+        '*.youtu.be',
+        'youtube-nocookie.com',
+        '*.youtube-nocookie.com',
+        '*.example.com',
+        '',
+      ].join('\n'),
+    );
     assert.equal(await readFile(settingsReadyPath, 'utf8'), 'ready\n');
   } finally {
     server.kill();

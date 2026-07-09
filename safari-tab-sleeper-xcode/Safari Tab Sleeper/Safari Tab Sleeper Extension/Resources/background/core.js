@@ -67,6 +67,7 @@ const INTERNAL_PROTOCOLS = new Set([
   'moz-extension:',
   'edge-extension:',
 ]);
+const YOUTUBE_FAMILY_DOMAINS = ['youtube.com', 'youtu.be', 'youtube-nocookie.com'];
 
 export function mergeSettings(settings = {}) {
   const profileDefaults = applyProfile(settings.profile ?? DEFAULT_SETTINGS.profile);
@@ -617,13 +618,32 @@ function isDomainMatched(url, patterns = []) {
   }
 
   return normalizeAllowlist(patterns).some((pattern) => {
-    if (pattern.startsWith('*.')) {
-      const suffix = pattern.slice(2);
-      return host === suffix || host.endsWith(`.${suffix}`);
-    }
-
-    return host === pattern;
+    return domainPatternMatchesHost(pattern, host) || domainsShareYouTubeFamily(pattern, host);
   });
+}
+
+function domainPatternMatchesHost(pattern, host) {
+  if (pattern.startsWith('*.')) {
+    const suffix = pattern.slice(2);
+    return host === suffix || host.endsWith(`.${suffix}`);
+  }
+
+  return host === pattern;
+}
+
+function domainsShareYouTubeFamily(pattern, host) {
+  return isYouTubeFamilyDomain(pattern) && isYouTubeFamilyDomain(host);
+}
+
+function isYouTubeFamilyDomain(value) {
+  const domain = String(value || '')
+    .toLowerCase()
+    .replace(/^\*\./, '')
+    .replace(/^www\./, '');
+
+  return YOUTUBE_FAMILY_DOMAINS.some((youtubeDomain) => (
+    domain === youtubeDomain || domain.endsWith(`.${youtubeDomain}`)
+  ));
 }
 
 export function getSleepReasonTag(reason) {

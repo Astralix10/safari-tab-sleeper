@@ -75,6 +75,10 @@ end isAllowlistedURL
 on isLocalSleeperURL(tabURL)
 	set lowerURL to my lowerText(tabURL)
 	if lowerURL starts with "file:" and lowerURL contains "local-sleeper.html" then return true
+	if lowerURL starts with "http://127.0.0.1:17654/sleep" then return true
+	if lowerURL starts with "safari-web-extension:" and lowerURL contains "/sleep/sleep.html" then return true
+	if lowerURL starts with "safari-extension:" and lowerURL contains "/sleep/sleep.html" then return true
+	if lowerURL starts with "chrome-extension:" and lowerURL contains "/sleep/sleep.html" then return true
 	return false
 end isLocalSleeperURL
 

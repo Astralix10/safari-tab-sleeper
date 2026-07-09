@@ -14,6 +14,7 @@ It targets the annoying case where long-lived tabs, especially YouTube, keep lar
 - Keeps the original tab title and favicon visible with `[sleep]` prefixes.
 - Skips active, pinned, audible, dirty-form, internal, and allowlisted tabs.
 - Syncs allowlisted sites to the local companion so forced memory cleanup does not sleep protected sites such as YouTube.
+- Treats YouTube allowlisting as a site family, covering `youtube.com`, subdomains, `youtu.be`, and embed/nocookie hosts.
 - Tracks long YouTube sessions inside one tab and sleeps risky inactive YouTube tabs faster.
 - Provides popup actions:
   - sleep current tab

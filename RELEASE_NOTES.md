@@ -1,5 +1,12 @@
 # Safari Tab Sleeper Release Notes
 
+## 0.1.2
+
+- Treat `www.youtube.com` in `Не усыплять сайт` as protection for the YouTube family: `youtube.com`, `*.youtube.com`, `youtu.be`, and YouTube embed/nocookie hosts.
+- Expanded the companion allowlist sync so AppleScript cleanup receives the same YouTube protection.
+- Prevented companion AppleScript cleanup from re-sleeping existing localhost or extension sleep pages.
+- Reset the companion settings-ready marker during install so upgrades wait for a fresh extension settings sync.
+
 ## 0.1.1
 
 - Fixed companion memory cleanup ignoring the extension's `Не усыплять сайт` allowlist.

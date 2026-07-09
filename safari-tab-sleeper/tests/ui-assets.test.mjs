@@ -97,8 +97,9 @@ test('sleep pages auto-restore when returning to a manually slept background tab
 });
 
 test('companion AppleScript cleanup respects the extension allowlist', async () => {
-  const [memoryGuard, installMenuBar, menuBarSwift, sleepHeavyScript, sleepAllScript] = await Promise.all([
+  const [memoryGuard, installLaunchAgent, installMenuBar, menuBarSwift, sleepHeavyScript, sleepAllScript] = await Promise.all([
     read('companion/memory-guard.zsh'),
+    read('companion/install-launch-agent.zsh'),
     read('companion/install-menu-bar.zsh'),
     read('menubar/Sources/SafariTabSleeperMenuBar/main.swift'),
     read('companion/sleep-inactive-youtube-tabs.applescript'),
@@ -106,11 +107,17 @@ test('companion AppleScript cleanup respects the extension allowlist', async () 
   ]);
 
   assert.equal(memoryGuard.includes('allowlist.txt'), true);
+  assert.equal(installLaunchAgent.includes('settings-ready'), true);
+  assert.equal(installLaunchAgent.includes('rm -f "$RUNTIME_DIR/settings-ready"'), true);
   assert.equal(installMenuBar.includes('allowlist.txt'), true);
   assert.equal(menuBarSwift.includes('scriptPath("allowlist.txt")'), true);
   assert.equal(sleepHeavyScript.includes('isAllowlistedURL'), true);
+  assert.equal(sleepHeavyScript.includes('127.0.0.1:17654/sleep'), true);
+  assert.equal(sleepHeavyScript.includes('/sleep/sleep.html'), true);
   assert.equal(sleepHeavyScript.includes('allowlistPath'), true);
   assert.equal(sleepHeavyScript.includes('not my isAllowlistedURL(originalURL, allowlistPath)'), true);
   assert.equal(sleepAllScript.includes('isAllowlistedURL'), true);
+  assert.equal(sleepAllScript.includes('127.0.0.1:17654/sleep'), true);
+  assert.equal(sleepAllScript.includes('/sleep/sleep.html'), true);
   assert.equal(sleepAllScript.includes('not my isAllowlistedURL(originalURL, allowlistPath)'), true);
 });

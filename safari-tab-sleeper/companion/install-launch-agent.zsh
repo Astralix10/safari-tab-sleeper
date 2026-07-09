@@ -19,6 +19,7 @@ cp "$SCRIPT_DIR/local-sleeper.html" "$RUNTIME_DIR/local-sleeper.html"
 cp "$SCRIPT_DIR/sleeper-server.py" "$RUNTIME_DIR/sleeper-server.py"
 chmod +x "$RUNTIME_DIR/memory-guard.zsh"
 touch "$RUNTIME_DIR/allowlist.txt"
+rm -f "$RUNTIME_DIR/settings-ready"
 
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -24,6 +24,15 @@ SETTINGS_READY_PATH = os.environ.get(
     os.path.join(os.path.dirname(ALLOWLIST_PATH) or os.path.dirname(__file__), "settings-ready"),
 )
 ARCHIVE_LIMIT = int(os.environ.get("SAFARI_TAB_SLEEPER_ARCHIVE_LIMIT", "300"))
+YOUTUBE_FAMILY_DOMAINS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+YOUTUBE_ALLOWLIST_PATTERNS = (
+    "youtube.com",
+    "*.youtube.com",
+    "youtu.be",
+    "*.youtu.be",
+    "youtube-nocookie.com",
+    "*.youtube-nocookie.com",
+)
 
 SLEEP_HTML = r"""<!doctype html>
 <html lang="ru">
@@ -325,6 +334,11 @@ def collect_power_status():
 def sanitize_domain_patterns(value):
     raw_entries = value if isinstance(value, list) else []
     patterns = []
+
+    def add_pattern(pattern):
+        if pattern and pattern not in patterns:
+            patterns.append(pattern)
+
     for raw_entry in raw_entries:
         entry = str(raw_entry or "").strip().lower()
         if not entry or entry.startswith("#"):
@@ -335,9 +349,20 @@ def sanitize_domain_patterns(value):
         entry = entry.split("/", 1)[0].strip()
         if not entry or entry.startswith("#"):
             continue
-        if entry not in patterns:
-            patterns.append(entry)
+        add_pattern(entry)
+        if is_youtube_family_domain(entry):
+            for youtube_pattern in YOUTUBE_ALLOWLIST_PATTERNS:
+                add_pattern(youtube_pattern)
     return patterns
+
+
+def is_youtube_family_domain(value):
+    domain = str(value or "").lower()
+    if domain.startswith("*."):
+        domain = domain[2:]
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return any(domain == youtube_domain or domain.endswith(f".{youtube_domain}") for youtube_domain in YOUTUBE_FAMILY_DOMAINS)
 
 
 def write_allowlist(patterns):

@@ -18,6 +18,7 @@ It helps keep Safari under control when long-lived tabs, especially YouTube, Twi
 - Backs up sleeping-tab restore data in a local archive.
 - Compacts duplicate archived URLs so old repeated links do not grow forever.
 - Syncs the never-sleep allowlist into the companion so memory-pressure cleanup respects protected sites.
+- Treats a YouTube allowlist entry as the whole YouTube family, including `youtu.be` and embeds.
 - Cleans likely-heavy background tabs under Safari/WebKit memory pressure.
 - Waits for the extension settings sync before forced companion cleanup after install or restart.
 - Adds a one-click `Освободить память сейчас` popup action.

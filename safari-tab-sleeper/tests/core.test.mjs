@@ -16,6 +16,7 @@ import {
   getSleepReasonTag,
   getSleepPageAutoRestoreDelay,
   isAggressiveDomain,
+  isAllowlisted,
   isPressureDomain,
   isSleepPageUrl,
   makeRuntimeMessageListener,
@@ -91,6 +92,18 @@ test('buildSleepDecision skips active, pinned, audible, internal, dirty, and all
     }).sleep,
     false,
   );
+});
+
+test('allowlisting YouTube protects the whole YouTube site family', () => {
+  const allowlist = ['www.youtube.com'];
+
+  assert.equal(isAllowlisted('https://www.youtube.com/watch?v=1', allowlist), true);
+  assert.equal(isAllowlisted('https://youtube.com/shorts/1', allowlist), true);
+  assert.equal(isAllowlisted('https://music.youtube.com/watch?v=1', allowlist), true);
+  assert.equal(isAllowlisted('https://m.youtube.com/watch?v=1', allowlist), true);
+  assert.equal(isAllowlisted('https://youtu.be/abc', allowlist), true);
+  assert.equal(isAllowlisted('https://www.youtube-nocookie.com/embed/abc', allowlist), true);
+  assert.equal(isAllowlisted('https://example.com/youtube.com', allowlist), false);
 });
 
 test('profiles tune sleep timing and media behavior', () => {
