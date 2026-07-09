@@ -134,3 +134,11 @@ test('memory guard uses notification center instead of modal dialogs', async () 
   assert.equal(script.includes('display dialog'), false);
   assert.equal(script.includes('display notification'), true);
 });
+
+test('memory guard waits for extension settings sync before pressure sleeping', async () => {
+  const script = await readFile(new URL('../companion/memory-guard.zsh', import.meta.url), 'utf8');
+
+  assert.equal(script.includes('settings-ready'), true);
+  assert.equal(script.includes('settings_are_synced()'), true);
+  assert.equal(script.includes('settings_pending=1'), true);
+});

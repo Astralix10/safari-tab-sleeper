@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -125,6 +125,43 @@ test('sleep server exposes power source status', async () => {
     assert.equal(body.ok, true);
     assert.match(body.source, /^(battery|power|unknown)$/);
     assert.equal(typeof body.label, 'string');
+  } finally {
+    server.kill();
+  }
+});
+
+test('sleep server syncs extension allowlist for companion AppleScript cleanup', async () => {
+  const port = 25000 + Math.floor(Math.random() * 1000);
+  const dir = await mkdtemp(join(tmpdir(), 'safari-tab-sleeper-settings-'));
+  const allowlistPath = join(dir, 'allowlist.txt');
+  const settingsReadyPath = join(dir, 'settings-ready');
+  const server = spawn('python3', ['companion/sleeper-server.py'], {
+    cwd: new URL('..', import.meta.url),
+    env: {
+      ...process.env,
+      SAFARI_TAB_SLEEPER_PORT: String(port),
+      SAFARI_TAB_SLEEPER_ALLOWLIST_PATH: allowlistPath,
+      SAFARI_TAB_SLEEPER_SETTINGS_READY_PATH: settingsReadyPath,
+    },
+    stdio: 'ignore',
+  });
+
+  try {
+    await waitForHealth(port);
+    const response = await fetch(`http://127.0.0.1:${port}/settings`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        allowlist: ['www.youtube.com', '*.example.com', '#ignored'],
+      }),
+    });
+    assert.equal(response.ok, true);
+
+    const body = await response.json();
+    assert.equal(body.ready, true);
+    assert.deepEqual(body.allowlist, ['www.youtube.com', '*.example.com']);
+    assert.equal(await readFile(allowlistPath, 'utf8'), 'www.youtube.com\n*.example.com\n');
+    assert.equal(await readFile(settingsReadyPath, 'utf8'), 'ready\n');
   } finally {
     server.kill();
   }

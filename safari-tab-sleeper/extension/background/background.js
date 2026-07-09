@@ -51,9 +51,11 @@ async function readSettings() {
 }
 
 async function writeSettings(settings) {
+  const mergedSettings = mergeSettings(settings);
   await api.storage.local.set({
-    [STORAGE_KEYS.settings]: mergeSettings(settings),
+    [STORAGE_KEYS.settings]: mergedSettings,
   });
+  await syncCompanionSettings(mergedSettings);
 }
 
 async function readObject(key) {
@@ -220,6 +222,7 @@ async function readPowerStatus(settings) {
 
 async function readRuntimeSettings() {
   const baseSettings = await readSettings();
+  await syncCompanionSettings(baseSettings);
   const powerStatus = await readPowerStatus(baseSettings);
   return {
     baseSettings,
@@ -235,6 +238,20 @@ async function archiveSleepEntry(settings, entry) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ entry }),
+    },
+  });
+}
+
+async function syncCompanionSettings(settings) {
+  await readLocalJson(settings, '/settings', {
+    timeoutMs: 700,
+    fetchOptions: {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        allowlist: settings.allowlist ?? [],
+        pressureDomains: settings.pressureDomains ?? [],
+      }),
     },
   });
 }

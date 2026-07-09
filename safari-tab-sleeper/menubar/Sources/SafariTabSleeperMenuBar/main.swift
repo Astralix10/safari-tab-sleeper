@@ -104,7 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func runScriptAction(title: String, scriptName: String, messagePrefix: String) {
         runInBackground({ [self] in
-            run("/usr/bin/osascript", [scriptPath(scriptName), scriptPath("local-sleeper.html")])
+            run("/usr/bin/osascript", [scriptPath(scriptName), scriptPath("local-sleeper.html"), scriptPath("allowlist.txt")])
         }, completion: { [self] output in
             let sleptCount = numericField("slept_count", in: output) ?? 0
             notify(title, "\(messagePrefix): усыплено вкладок: \(sleptCount).")

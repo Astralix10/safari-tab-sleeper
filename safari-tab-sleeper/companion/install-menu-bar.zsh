@@ -21,6 +21,7 @@ cp "$SCRIPT_DIR/sleep-inactive-youtube-tabs.applescript" "$RUNTIME_DIR/sleep-ina
 cp "$SCRIPT_DIR/sleep-all-inactive-tabs.applescript" "$RUNTIME_DIR/sleep-all-inactive-tabs.applescript"
 cp "$SCRIPT_DIR/local-sleeper.html" "$RUNTIME_DIR/local-sleeper.html"
 chmod +x "$RUNTIME_DIR/$BINARY_NAME" "$RUNTIME_DIR/memory-guard.zsh"
+touch "$RUNTIME_DIR/allowlist.txt"
 
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -17,7 +17,9 @@ It helps keep Safari under control when long-lived tabs, especially YouTube, Twi
 - Keeps original tab titles and favicons visible with `[sleep]` prefixes.
 - Backs up sleeping-tab restore data in a local archive.
 - Compacts duplicate archived URLs so old repeated links do not grow forever.
+- Syncs the never-sleep allowlist into the companion so memory-pressure cleanup respects protected sites.
 - Cleans likely-heavy background tabs under Safari/WebKit memory pressure.
+- Waits for the extension settings sync before forced companion cleanup after install or restart.
 - Adds a one-click `Освободить память сейчас` popup action.
 - Uses power-aware timing: faster cleanup on battery, softer cleanup on power.
 - Uses normal Notification Center notifications instead of modal system dialogs.

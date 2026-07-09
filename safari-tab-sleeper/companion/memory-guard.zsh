@@ -12,6 +12,7 @@ ONCE="0"
 DRY_RUN="0"
 AUTO_SLEEP_PRESSURE_DOMAINS="1"
 PAUSE_FILE="$SCRIPT_DIR/pause-until"
+SETTINGS_READY_FILE="$SCRIPT_DIR/settings-ready"
 
 usage() {
   cat <<'EOF'
@@ -175,6 +176,10 @@ pause_remaining_seconds() {
   print "0"
 }
 
+settings_are_synced() {
+  [[ -f "$SETTINGS_READY_FILE" ]]
+}
+
 show_memory_alert_notification() {
   local total_mb="$1"
   local max_mb="$2"
@@ -210,7 +215,12 @@ APPLESCRIPT
 }
 
 sleep_inactive_pressure_tabs() {
-  osascript "$SCRIPT_DIR/sleep-inactive-youtube-tabs.applescript" "$SCRIPT_DIR/local-sleeper.html" 2>/dev/null || true
+  if ! settings_are_synced; then
+    print "slept_count=0 settings_pending=1"
+    return 0
+  fi
+
+  osascript "$SCRIPT_DIR/sleep-inactive-youtube-tabs.applescript" "$SCRIPT_DIR/local-sleeper.html" "$SCRIPT_DIR/allowlist.txt" 2>/dev/null || true
 }
 
 LAST_ALERT_AT="0"

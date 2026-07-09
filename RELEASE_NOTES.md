@@ -1,5 +1,13 @@
 # Safari Tab Sleeper Release Notes
 
+## 0.1.1
+
+- Fixed companion memory cleanup ignoring the extension's `Не усыплять сайт` allowlist.
+- Synced allowlisted domains to the localhost companion through `/settings`.
+- Updated AppleScript cleanup paths to skip allowlisted hosts before sleeping heavy or background tabs.
+- Made the memory guard wait for first extension settings sync before forced cleanup, preventing startup races.
+- Added regression tests for allowlist sync and companion cleanup behavior.
+
 ## 0.1.0
 
 - Added automatic stuck sleep-tab healing.

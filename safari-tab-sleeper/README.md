@@ -13,6 +13,7 @@ It targets the annoying case where long-lived tabs, especially YouTube, keep lar
 - Retries restore for active sleep pages that get stuck.
 - Keeps the original tab title and favicon visible with `[sleep]` prefixes.
 - Skips active, pinned, audible, dirty-form, internal, and allowlisted tabs.
+- Syncs allowlisted sites to the local companion so forced memory cleanup does not sleep protected sites such as YouTube.
 - Tracks long YouTube sessions inside one tab and sleeps risky inactive YouTube tabs faster.
 - Provides popup actions:
   - sleep current tab
@@ -26,6 +27,7 @@ It targets the annoying case where long-lived tabs, especially YouTube, keep lar
 - Uses a local recovery archive for sleeping-tab URLs.
 - Automatically compacts duplicate archived URLs so the archive does not grow forever.
 - Runs a companion monitor that silently cleans heavy background tabs around 3 GB and sends normal Notification Center alerts around 5 GB.
+- Waits for extension settings sync before the companion performs forced memory cleanup.
 
 ## Honest Limitation
 
@@ -103,6 +105,7 @@ Useful endpoints:
 - `/health`: health check.
 - `/memory`: Safari/WebKit memory summary.
 - `/power`: battery or power-adapter status.
+- `/settings`: synced allowlist used by companion AppleScript cleanup.
 - `/sleep`: lightweight sleep page.
 - `/archive-entry`: local backup store for sleeping-tab restore data.
 

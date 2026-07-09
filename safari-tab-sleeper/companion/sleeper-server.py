@@ -15,6 +15,14 @@ ARCHIVE_PATH = os.environ.get(
     "SAFARI_TAB_SLEEPER_ARCHIVE_PATH",
     os.path.join(os.path.dirname(__file__), "sleep-archive.json"),
 )
+ALLOWLIST_PATH = os.environ.get(
+    "SAFARI_TAB_SLEEPER_ALLOWLIST_PATH",
+    os.path.join(os.path.dirname(__file__), "allowlist.txt"),
+)
+SETTINGS_READY_PATH = os.environ.get(
+    "SAFARI_TAB_SLEEPER_SETTINGS_READY_PATH",
+    os.path.join(os.path.dirname(ALLOWLIST_PATH) or os.path.dirname(__file__), "settings-ready"),
+)
 ARCHIVE_LIMIT = int(os.environ.get("SAFARI_TAB_SLEEPER_ARCHIVE_LIMIT", "300"))
 
 SLEEP_HTML = r"""<!doctype html>
@@ -314,6 +322,63 @@ def collect_power_status():
     }
 
 
+def sanitize_domain_patterns(value):
+    raw_entries = value if isinstance(value, list) else []
+    patterns = []
+    for raw_entry in raw_entries:
+        entry = str(raw_entry or "").strip().lower()
+        if not entry or entry.startswith("#"):
+            continue
+        if "://" in entry:
+            parsed = urlparse(entry)
+            entry = parsed.hostname or ""
+        entry = entry.split("/", 1)[0].strip()
+        if not entry or entry.startswith("#"):
+            continue
+        if entry not in patterns:
+            patterns.append(entry)
+    return patterns
+
+
+def write_allowlist(patterns):
+    allowlist_dir = os.path.dirname(ALLOWLIST_PATH)
+    if allowlist_dir:
+        os.makedirs(allowlist_dir, exist_ok=True)
+    with open(ALLOWLIST_PATH, "w", encoding="utf-8") as file:
+        file.write("".join(f"{pattern}\n" for pattern in patterns))
+
+
+def write_settings_ready():
+    ready_dir = os.path.dirname(SETTINGS_READY_PATH)
+    if ready_dir:
+        os.makedirs(ready_dir, exist_ok=True)
+    with open(SETTINGS_READY_PATH, "w", encoding="utf-8") as file:
+        file.write("ready\n")
+
+
+def settings_ready():
+    return os.path.exists(SETTINGS_READY_PATH)
+
+
+def read_allowlist():
+    try:
+        with open(ALLOWLIST_PATH, "r", encoding="utf-8") as file:
+            return sanitize_domain_patterns(file.read().splitlines())
+    except Exception:
+        return []
+
+
+def save_companion_settings(settings):
+    allowlist = sanitize_domain_patterns(settings.get("allowlist") if isinstance(settings, dict) else [])
+    write_allowlist(allowlist)
+    write_settings_ready()
+    return {
+        "ok": True,
+        "ready": True,
+        "allowlist": allowlist,
+    }
+
+
 def normalize_archive_url(value):
     text = str(value or "").strip()
     parsed = urlparse(text)
@@ -417,6 +482,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/power":
             self.send_json(200, collect_power_status())
             return
+        if path == "/settings":
+            self.send_json(200, {"ok": True, "ready": settings_ready(), "allowlist": read_allowlist()})
+            return
         if path == "/archive-entry":
             query = parse_qs(urlparse(self.path).query)
             token = (query.get("token") or [""])[0]
@@ -438,6 +506,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/settings":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw_body = self.rfile.read(min(length, 256 * 1024))
+                body = json.loads(raw_body.decode("utf-8") or "{}")
+                self.send_json(200, save_companion_settings(body))
+            except Exception as error:
+                self.send_json(500, {"ok": False, "reason": str(error)})
+            return
+
         if path != "/archive-entry":
             self.send_text(404, "not found\n", "text/plain; charset=utf-8")
             return
