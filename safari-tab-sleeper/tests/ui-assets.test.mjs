@@ -91,26 +91,39 @@ test('sleep pages auto-restore when returning to a manually slept background tab
   assert.equal(sleeperServer.includes("let wasHiddenAfterSleep = document.visibilityState === 'hidden';"), true);
   assert.equal(sleeperServer.includes("entry.reason === 'manual-current-tab' && wasHiddenAfterSleep"), true);
   assert.equal(sleeperServer.includes('function scheduleRestoreOnReturn()'), true);
+  assert.equal(sleeperServer.includes('function unwrapSleepUrl'), true);
 
   assert.equal(localSleeper.includes('function scheduleRestoreOnReturn()'), true);
+  assert.equal(localSleeper.includes('function unwrapSleepUrl'), true);
   assert.equal(localSleeper.includes('wasHiddenAfterSleep && restorableUrl'), true);
 });
 
 test('companion AppleScript cleanup respects the extension allowlist', async () => {
-  const [memoryGuard, installLaunchAgent, installMenuBar, menuBarSwift, sleepHeavyScript, sleepAllScript] = await Promise.all([
+  const [background, pageGuard, memoryGuard, installLaunchAgent, installMenuBar, menuBarSwift, sleepCurrentScript, sleepHeavyScript, sleepAllScript] = await Promise.all([
+    read('extension/background/background.js'),
+    read('extension/content/page-guard.js'),
     read('companion/memory-guard.zsh'),
     read('companion/install-launch-agent.zsh'),
     read('companion/install-menu-bar.zsh'),
     read('menubar/Sources/SafariTabSleeperMenuBar/main.swift'),
+    read('companion/sleep-current-tab.applescript'),
     read('companion/sleep-inactive-youtube-tabs.applescript'),
     read('companion/sleep-all-inactive-tabs.applescript'),
   ]);
 
+  assert.equal(background.includes('scanInFlight'), true);
+  assert.equal(background.includes('pendingTabSleeps'), true);
+  assert.equal(background.includes('storageMutationQueues'), true);
+  assert.equal(background.includes('sleep-navigation-failed'), true);
+  assert.equal(pageGuard.includes('dirty = false;'), true);
   assert.equal(memoryGuard.includes('allowlist.txt'), true);
+  assert.equal(memoryGuard.includes('http://127.0.0.1:17654/sleep'), true);
   assert.equal(installLaunchAgent.includes('settings-ready'), true);
   assert.equal(installLaunchAgent.includes('rm -f "$RUNTIME_DIR/settings-ready"'), true);
   assert.equal(installMenuBar.includes('allowlist.txt'), true);
+  assert.equal(menuBarSwift.includes('sleepServerURL'), true);
   assert.equal(menuBarSwift.includes('scriptPath("allowlist.txt")'), true);
+  assert.equal(sleepCurrentScript.includes('sleepPageBaseURL'), true);
   assert.equal(sleepHeavyScript.includes('isAllowlistedURL'), true);
   assert.equal(sleepHeavyScript.includes('127.0.0.1:17654/sleep'), true);
   assert.equal(sleepHeavyScript.includes('/sleep/sleep.html'), true);

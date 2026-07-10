@@ -11,17 +11,17 @@ import {
   extractSleepToken,
   formatReason,
   hostnameFromUrl,
-  isAllowlisted,
   isPressureDomain,
   isYouTubeUrl,
   makeSleepToken,
   makeRuntimeMessageListener,
+  mergeYouTubePageState,
   mergeSettings,
   normalizeRestorableUrl,
-  normalizeAllowlist,
   reconcileSleepingTabsWithOpenTabs,
   shouldHealStuckSleepTab,
   shouldTreatYouTubeAsHighRisk,
+  toggleAllowlistForHost,
 } from './core.js';
 
 const api = globalThis.browser ?? globalThis.chrome;
@@ -44,6 +44,10 @@ const AUTO_RESTORE_REASONS = new Set([
   'manual-all-except-current',
 ]);
 const pendingSleepHeals = new Set();
+const pendingTabSleeps = new Set();
+const storageMutationQueues = new Map();
+let sleepQueue = Promise.resolve();
+let scanInFlight = null;
 
 async function readSettings() {
   const result = await api.storage.local.get(STORAGE_KEYS.settings);
@@ -59,27 +63,46 @@ async function writeSettings(settings) {
 }
 
 async function readObject(key) {
+  await (storageMutationQueues.get(key) ?? Promise.resolve());
+  return readObjectImmediately(key);
+}
+
+async function readObjectImmediately(key) {
   const result = await api.storage.local.get(key);
   return result[key] ?? {};
 }
 
-async function writeObject(key, value) {
-  await api.storage.local.set({ [key]: value });
+function mutateObject(key, mutator) {
+  const previous = storageMutationQueues.get(key) ?? Promise.resolve();
+  const operation = previous.then(async () => {
+    const value = await readObjectImmediately(key);
+    const result = await mutator(value);
+    await api.storage.local.set({ [key]: value });
+    return result;
+  });
+  const settled = operation.catch(() => undefined);
+  storageMutationQueues.set(key, settled);
+  void settled.finally(() => {
+    if (storageMutationQueues.get(key) === settled) {
+      storageMutationQueues.delete(key);
+    }
+  });
+  return operation;
 }
 
 async function patchTabState(tabId, patch) {
-  const states = await readObject(STORAGE_KEYS.tabStates);
-  const key = String(tabId);
-  const compactPatch = Object.fromEntries(
-    Object.entries(patch).filter(([, value]) => value !== undefined),
-  );
-  states[key] = {
-    ...(states[key] ?? {}),
-    ...compactPatch,
-    updatedAt: Date.now(),
-  };
-  await writeObject(STORAGE_KEYS.tabStates, states);
-  return states[key];
+  return mutateObject(STORAGE_KEYS.tabStates, (states) => {
+    const key = String(tabId);
+    const compactPatch = Object.fromEntries(
+      Object.entries(patch).filter(([, value]) => value !== undefined),
+    );
+    states[key] = {
+      ...(states[key] ?? {}),
+      ...compactPatch,
+      updatedAt: Date.now(),
+    };
+    return states[key];
+  });
 }
 
 async function getTabState(tabId) {
@@ -87,31 +110,39 @@ async function getTabState(tabId) {
   return states[String(tabId)] ?? {};
 }
 
-async function ensureTabState(tab) {
-  const state = await getTabState(tab.id);
+async function ensureTabState(tab, knownState = null) {
+  const state = knownState ?? await getTabState(tab.id);
   const now = Date.now();
 
   if (state.createdAt) {
-    return patchTabState(tab.id, {
+    const patch = {};
+    if (tab.title !== state.title) patch.title = tab.title;
+    if (tab.url !== state.url) patch.url = tab.url;
+    if (tab.favIconUrl !== state.favIconUrl) patch.favIconUrl = tab.favIconUrl;
+    if (tab.active) patch.lastActiveAt = now;
+    return Object.keys(patch).length > 0 ? patchTabState(tab.id, patch) : state;
+  }
+
+  return mutateObject(STORAGE_KEYS.tabStates, (states) => {
+    const key = String(tab.id);
+    const current = states[key] ?? {};
+    states[key] = {
+      createdAt: now,
+      lastActiveAt: now,
+      dirty: false,
+      youtubeVideoCount: 0,
+      ...current,
       title: tab.title,
       url: tab.url,
       favIconUrl: tab.favIconUrl,
-      lastActiveAt: tab.active ? now : state.lastActiveAt,
-    });
-  }
-
-  return patchTabState(tab.id, {
-    createdAt: now,
-    lastActiveAt: now,
-    title: tab.title,
-    url: tab.url,
-    favIconUrl: tab.favIconUrl,
-    dirty: false,
-    youtubeVideoCount: 0,
+      lastActiveAt: tab.active ? now : (current.lastActiveAt ?? now),
+      updatedAt: now,
+    };
+    return states[key];
   });
 }
 
-async function askPageCanSleep(tab, settings) {
+async function askPageCanSleep(tab, settings, state) {
   if (!settings.protectDirtyForms) {
     return { canSleep: true };
   }
@@ -119,9 +150,10 @@ async function askPageCanSleep(tab, settings) {
   try {
     const response = await api.tabs.sendMessage(tab.id, { type: 'tab-sleeper:can-sleep' });
     if (response && typeof response === 'object') {
+      const youtubeState = mergeYouTubePageState(state, response);
       await patchTabState(tab.id, {
         dirty: Boolean(response.dirty),
-        youtubeVideoCount: Number(response.youtubeVideoCount ?? 0),
+        ...youtubeState,
       });
       return {
         canSleep: response.canSleep !== false,
@@ -141,15 +173,18 @@ async function notifyOnce(id, title, message) {
   }
 
   try {
-    const notificationState = await readObject(STORAGE_KEYS.notificationState);
     const now = Date.now();
-    const previous = notificationState[id] ?? 0;
-    if (now - previous < 30 * 60_000) {
+    const shouldNotify = await mutateObject(STORAGE_KEYS.notificationState, (notificationState) => {
+      const previous = notificationState[id] ?? 0;
+      if (now - previous < 30 * 60_000) {
+        return false;
+      }
+      notificationState[id] = now;
+      return true;
+    });
+    if (!shouldNotify) {
       return;
     }
-
-    notificationState[id] = now;
-    await writeObject(STORAGE_KEYS.notificationState, notificationState);
     await api.notifications.create(id, {
       type: 'basic',
       iconUrl: api.runtime.getURL('icons/icon-128.svg'),
@@ -300,10 +335,37 @@ function extractKnownSleepToken(tabUrl, settings) {
   return extractLocalSleepToken(tabUrl, settings.sleepServerUrl || DEFAULT_SETTINGS.sleepServerUrl);
 }
 
-async function sleepTab(tab, reason, options = {}) {
+function sleepTab(tab, reason, options = {}) {
+  if (!tab?.id) {
+    return Promise.resolve({ ok: false, reason: 'missing-tab' });
+  }
+  if (pendingTabSleeps.has(tab.id)) {
+    return Promise.resolve({ ok: false, reason: 'sleep-already-in-progress' });
+  }
+
+  pendingTabSleeps.add(tab.id);
+  const operation = sleepQueue.then(() => performSleepTab(tab, reason, options));
+  sleepQueue = operation.catch(() => undefined);
+  return operation.finally(() => {
+    pendingTabSleeps.delete(tab.id);
+  });
+}
+
+async function rollbackSleepPreparation(tabId, token) {
+  await mutateObject(STORAGE_KEYS.sleepingTabs, (sleepingTabs) => {
+    delete sleepingTabs[token];
+  });
+  await patchTabState(tabId, {
+    sleepToken: null,
+    sleptAt: null,
+    sleepStrategy: null,
+  });
+}
+
+async function performSleepTab(tab, reason, options = {}) {
   const settings = options.settings ?? (await readRuntimeSettings()).settings;
   const state = await ensureTabState(tab);
-  const guard = await askPageCanSleep(tab, settings);
+  const guard = await askPageCanSleep(tab, settings, state);
 
   if (!guard.canSleep && !options.forceDirty) {
     return { ok: false, reason: 'dirty-form' };
@@ -323,7 +385,6 @@ async function sleepTab(tab, reason, options = {}) {
     return { ok: false, reason: 'unrestorable-url' };
   }
 
-  const sleepingTabs = await readObject(STORAGE_KEYS.sleepingTabs);
   const sleptAt = Date.now();
   const sleepEntry = {
     token,
@@ -335,8 +396,9 @@ async function sleepTab(tab, reason, options = {}) {
     reason,
     autoRestore: AUTO_RESTORE_REASONS.has(reason),
   };
-  sleepingTabs[token] = sleepEntry;
-  await writeObject(STORAGE_KEYS.sleepingTabs, sleepingTabs);
+  await mutateObject(STORAGE_KEYS.sleepingTabs, (sleepingTabs) => {
+    sleepingTabs[token] = sleepEntry;
+  });
   await archiveSleepEntry(settings, sleepEntry);
   await patchTabState(tab.id, {
     sleepToken: token,
@@ -366,16 +428,16 @@ async function sleepTab(tab, reason, options = {}) {
 
   const sleepUrl = await buildSleepNavigationUrl(settings, token, sleepEntry);
   if (!sleepUrl) {
-    delete sleepingTabs[token];
-    await writeObject(STORAGE_KEYS.sleepingTabs, sleepingTabs);
-    await patchTabState(tab.id, {
-      sleepToken: null,
-      sleptAt: null,
-    });
+    await rollbackSleepPreparation(tab.id, token);
     return { ok: false, reason: 'sleep-server-unavailable' };
   }
 
-  await api.tabs.update(tab.id, { url: sleepUrl });
+  try {
+    await api.tabs.update(tab.id, { url: sleepUrl });
+  } catch {
+    await rollbackSleepPreparation(tab.id, token);
+    return { ok: false, reason: 'sleep-navigation-failed' };
+  }
   return { ok: true, token, reason, strategy: 'sleep-page' };
 }
 
@@ -389,8 +451,9 @@ async function restoreSleepingTab(tabId, token) {
   }
 
   await api.tabs.update(tabId, { url: restorableUrl });
-  delete sleepingTabs[token];
-  await writeObject(STORAGE_KEYS.sleepingTabs, sleepingTabs);
+  await mutateObject(STORAGE_KEYS.sleepingTabs, (currentSleepingTabs) => {
+    delete currentSleepingTabs[token];
+  });
   await patchTabState(tabId, {
     lastActiveAt: Date.now(),
     sleepToken: null,
@@ -460,42 +523,59 @@ async function markTabActive(tabId) {
   }
 }
 
-async function scanTabs() {
+async function performTabScan() {
   const { settings } = await readRuntimeSettings();
-  const tabs = await api.tabs.query({});
+  const [tabs, knownStates] = await Promise.all([
+    api.tabs.query({}),
+    readObject(STORAGE_KEYS.tabStates),
+  ]);
 
   for (const tab of tabs) {
-    if (!tab.id || !tab.url) {
-      continue;
-    }
-
-    const state = await ensureTabState(tab);
-
-    if (tab.active) {
-      await patchTabState(tab.id, { lastActiveAt: Date.now() });
-      scheduleStuckSleepHeal(tab, settings);
-      if (shouldTreatYouTubeAsHighRisk(tab.url, state, settings)) {
-        await notifyOnce(
-          `youtube-risk-${tab.id}`,
-          'YouTube-вкладка тяжелеет',
-          `В этой вкладке уже ${state.youtubeVideoCount} переходов по видео. Когда закончишь, усыпи её через попап.`,
-        );
+    try {
+      if (!tab.id || !tab.url) {
+        continue;
       }
-      continue;
-    }
 
-    const decision = buildSleepDecision({
-      tab,
-      state,
-      settings,
-      now: Date.now(),
-      runtimeBaseUrl: RUNTIME_BASE_URL,
-    });
+      const state = await ensureTabState(tab, knownStates[String(tab.id)] ?? {});
 
-    if (decision.sleep) {
-      await sleepTab(tab, decision.reason);
+      if (tab.active) {
+        scheduleStuckSleepHeal(tab, settings);
+        if (shouldTreatYouTubeAsHighRisk(tab.url, state, settings)) {
+          await notifyOnce(
+            `youtube-risk-${tab.id}`,
+            'YouTube-вкладка тяжелеет',
+            `В этой вкладке уже ${state.youtubeVideoCount} переходов по видео. Когда закончишь, усыпи её через попап.`,
+          );
+        }
+        continue;
+      }
+
+      const decision = buildSleepDecision({
+        tab,
+        state,
+        settings,
+        now: Date.now(),
+        runtimeBaseUrl: RUNTIME_BASE_URL,
+      });
+
+      if (decision.sleep) {
+        await sleepTab(tab, decision.reason, { settings });
+      }
+    } catch {
+      // A closed or restricted tab must not abort the rest of the scan.
     }
   }
+}
+
+function runTabScan() {
+  if (scanInFlight) {
+    return scanInFlight;
+  }
+
+  scanInFlight = performTabScan().catch(() => null).finally(() => {
+    scanInFlight = null;
+  });
+  return scanInFlight;
 }
 
 async function sleepCurrentTab() {
@@ -588,22 +668,20 @@ function sleepingTabsListFromStore(sleepingTabs) {
 
 async function readCurrentSleepingTabs(settings = null) {
   const resolvedSettings = settings ?? await readSettings();
-  const [sleepingTabs, openTabs] = await Promise.all([
-    readObject(STORAGE_KEYS.sleepingTabs),
-    api.tabs.query({}),
-  ]);
-  const currentSleepingTabs = reconcileSleepingTabsWithOpenTabs(
-    sleepingTabs,
-    openTabs,
-    resolvedSettings,
-    RUNTIME_BASE_URL,
-  );
-
-  if (JSON.stringify(currentSleepingTabs) !== JSON.stringify(sleepingTabs)) {
-    await writeObject(STORAGE_KEYS.sleepingTabs, currentSleepingTabs);
-  }
-
-  return currentSleepingTabs;
+  const openTabs = await api.tabs.query({});
+  return mutateObject(STORAGE_KEYS.sleepingTabs, (sleepingTabs) => {
+    const currentSleepingTabs = reconcileSleepingTabsWithOpenTabs(
+      sleepingTabs,
+      openTabs,
+      resolvedSettings,
+      RUNTIME_BASE_URL,
+    );
+    for (const token of Object.keys(sleepingTabs)) {
+      delete sleepingTabs[token];
+    }
+    Object.assign(sleepingTabs, currentSleepingTabs);
+    return currentSleepingTabs;
+  });
 }
 
 async function restoreAllSleepingTabs() {
@@ -612,39 +690,29 @@ async function restoreAllSleepingTabs() {
   let skippedCount = 0;
 
   for (const [token, entry] of Object.entries(sleepingTabs)) {
-    if (!entry?.tabId || !entry?.url) {
+    const restorableUrl = normalizeRestorableUrl(entry?.url);
+    if (!entry?.tabId || !restorableUrl) {
       skippedCount += 1;
       continue;
     }
 
     try {
-      await api.tabs.update(entry.tabId, { url: entry.url });
+      await api.tabs.update(entry.tabId, { url: restorableUrl });
       await patchTabState(entry.tabId, {
         lastActiveAt: Date.now(),
         sleepToken: null,
         restoredAt: Date.now(),
       });
-      delete sleepingTabs[token];
+      await mutateObject(STORAGE_KEYS.sleepingTabs, (currentSleepingTabs) => {
+        delete currentSleepingTabs[token];
+      });
       restoredCount += 1;
     } catch {
       skippedCount += 1;
     }
   }
 
-  await writeObject(STORAGE_KEYS.sleepingTabs, sleepingTabs);
   return { ok: true, restoredCount, skippedCount };
-}
-
-function allowlistEntryMatchesHost(entry, host) {
-  const [pattern] = normalizeAllowlist([entry]);
-  if (!pattern) {
-    return false;
-  }
-  if (pattern.startsWith('*.')) {
-    const suffix = pattern.slice(2);
-    return host === suffix || host.endsWith(`.${suffix}`);
-  }
-  return host === pattern;
 }
 
 async function toggleCurrentDomainInAllowlist() {
@@ -655,16 +723,12 @@ async function toggleCurrentDomainInAllowlist() {
   }
 
   const settings = await readSettings();
-  const allowlist = normalizeAllowlist(settings.allowlist ?? []);
-  const isEnabled = isAllowlisted(`https://${host}/`, allowlist);
-  const nextAllowlist = isEnabled
-    ? allowlist.filter((entry) => !allowlistEntryMatchesHost(entry, host))
-    : Array.from(new Set([...allowlist, host])).sort();
+  const result = toggleAllowlistForHost(settings.allowlist ?? [], host);
 
-  await writeSettings({ ...settings, allowlist: nextAllowlist });
+  await writeSettings({ ...settings, allowlist: result.allowlist });
   return {
     ok: true,
-    enabled: !isEnabled,
+    enabled: result.enabled,
     domain: host,
     settings: await readSettings(),
   };
@@ -712,23 +776,30 @@ async function getSleepEntry(token) {
 }
 
 async function cleanupRemovedTab(tabId) {
-  const states = await readObject(STORAGE_KEYS.tabStates);
-  const state = states[String(tabId)];
-  delete states[String(tabId)];
-  await writeObject(STORAGE_KEYS.tabStates, states);
+  const state = await mutateObject(STORAGE_KEYS.tabStates, (states) => {
+    const removedState = states[String(tabId)];
+    delete states[String(tabId)];
+    return removedState;
+  });
 
   if (state?.sleepToken) {
-    const sleepingTabs = await readObject(STORAGE_KEYS.sleepingTabs);
-    delete sleepingTabs[state.sleepToken];
-    await writeObject(STORAGE_KEYS.sleepingTabs, sleepingTabs);
+    await mutateObject(STORAGE_KEYS.sleepingTabs, (sleepingTabs) => {
+      delete sleepingTabs[state.sleepToken];
+    });
   }
 }
 
 async function resetYouTubeCounter(tabId) {
+  const state = await getTabState(tabId);
   await patchTabState(tabId, {
     youtubeVideoCount: 0,
-    youtubeLastVideoUrl: '',
+    youtubeLastVideoUrl: state.youtubeLastVideoUrl || '',
   });
+  try {
+    await api.tabs.sendMessage(tabId, { type: 'tab-sleeper:reset-youtube-counter' });
+  } catch {
+    // The content script may be unavailable on a restricted page.
+  }
 }
 
 api.runtime.onInstalled.addListener(async () => {
@@ -745,12 +816,12 @@ api.runtime.onStartup?.addListener(() => {
 
 api.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === SCAN_ALARM) {
-    scanTabs();
+    void runTabScan();
   }
 });
 
 api.tabs.onActivated.addListener(({ tabId }) => {
-  markTabActive(tabId);
+  void markTabActive(tabId);
 });
 
 api.windows.onFocusChanged?.addListener(async (windowId) => {
@@ -766,7 +837,7 @@ api.windows.onFocusChanged?.addListener(async (windowId) => {
 
 api.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.url || changeInfo.title || changeInfo.status === 'complete') {
-    patchTabState(tabId, {
+    void patchTabState(tabId, {
       title: tab.title,
       url: tab.url,
       favIconUrl: tab.favIconUrl,
@@ -776,17 +847,18 @@ api.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 api.tabs.onRemoved.addListener((tabId) => {
-  cleanupRemovedTab(tabId);
+  void cleanupRemovedTab(tabId);
 });
 
 async function handleRuntimeMessage(message, sender) {
   const tabId = sender?.tab?.id;
 
   if (message?.type === 'tab-sleeper:page-state' && tabId) {
+    const existingState = sender.tab ? await ensureTabState(sender.tab) : await getTabState(tabId);
+    const youtubeState = mergeYouTubePageState(existingState, message);
     await patchTabState(tabId, {
       dirty: Boolean(message.dirty),
-      youtubeVideoCount: Number(message.youtubeVideoCount ?? 0),
-      youtubeLastVideoUrl: message.youtubeLastVideoUrl || '',
+      ...youtubeState,
     });
     return { ok: true };
   }
@@ -856,4 +928,4 @@ async function handleRuntimeMessage(message, sender) {
 api.runtime.onMessage.addListener(makeRuntimeMessageListener(handleRuntimeMessage));
 
 api.alarms.create(SCAN_ALARM, { periodInMinutes: 1 });
-scanTabs();
+void runTabScan();

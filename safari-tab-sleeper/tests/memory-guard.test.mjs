@@ -16,6 +16,7 @@ test('memory guard parses aggregate and max process RSS from ps-like input', asy
     '102 4200000 /System/Library/Frameworks/WebKit.framework/com.apple.WebKit.WebContent',
     '103 900000 /usr/libexec/OtherProcess',
     '104 6400000 /System/Library/Frameworks/WebKit.framework/com.apple.WebKit.WebContent',
+    '105 9000000 /Users/test/Library/Application Support/Safari Tab Sleeper/sleeper-server.py',
   ].join('\n'));
 
   const { stdout } = await execFileAsync('zsh', [
@@ -101,7 +102,7 @@ test('memory guard shows user alerts only after 5 GB by default', async () => {
   assert.match(high.stdout, /over_alert=1/);
 });
 
-test('memory guard treats swap pressure as over threshold even when Safari RSS is low', async () => {
+test('memory guard reports system swap without attributing it to Safari', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'safari-tab-sleeper-'));
   const psSample = join(dir, 'ps.txt');
   const swapSample = join(dir, 'swap.txt');
@@ -125,7 +126,8 @@ test('memory guard treats swap pressure as over threshold even when Safari RSS i
 
   assert.match(stdout, /total_mb=488/);
   assert.match(stdout, /swap_used_mb=4096/);
-  assert.match(stdout, /over_threshold=1/);
+  assert.match(stdout, /over_threshold=0/);
+  assert.match(stdout, /over_alert=0/);
 });
 
 test('memory guard uses notification center instead of modal dialogs', async () => {

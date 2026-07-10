@@ -35,6 +35,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
   ],
 });
 
+const SETTINGS_LIMITS = Object.freeze({
+  inactivityMinutes: Object.freeze({ min: 1, max: 180 }),
+  youtubeVideoThreshold: Object.freeze({ min: 2, max: 500 }),
+  youtubeHighRiskInactiveSeconds: Object.freeze({ min: 10, max: 1800 }),
+  aggressiveInactiveSeconds: Object.freeze({ min: 10, max: 1800 }),
+});
+
 const PROFILE_SETTINGS = Object.freeze({
   safe: Object.freeze({
     profile: 'safe',
@@ -70,15 +77,67 @@ const INTERNAL_PROTOCOLS = new Set([
 const YOUTUBE_FAMILY_DOMAINS = ['youtube.com', 'youtu.be', 'youtube-nocookie.com'];
 
 export function mergeSettings(settings = {}) {
-  const profileDefaults = applyProfile(settings.profile ?? DEFAULT_SETTINGS.profile);
+  const profile = Object.hasOwn(PROFILE_SETTINGS, settings.profile)
+    ? settings.profile
+    : DEFAULT_SETTINGS.profile;
+  const profileDefaults = applyProfile(profile);
+  const defaults = { ...DEFAULT_SETTINGS, ...profileDefaults };
+
   return {
-    ...DEFAULT_SETTINGS,
-    ...profileDefaults,
-    ...settings,
+    profile,
+    inactivityMinutes: clampSettingNumber(settings.inactivityMinutes, defaults.inactivityMinutes, SETTINGS_LIMITS.inactivityMinutes),
+    youtubeVideoThreshold: clampSettingNumber(settings.youtubeVideoThreshold, defaults.youtubeVideoThreshold, SETTINGS_LIMITS.youtubeVideoThreshold),
+    youtubeHighRiskInactiveSeconds: clampSettingNumber(
+      settings.youtubeHighRiskInactiveSeconds,
+      defaults.youtubeHighRiskInactiveSeconds,
+      SETTINGS_LIMITS.youtubeHighRiskInactiveSeconds,
+    ),
+    aggressiveInactiveSeconds: clampSettingNumber(
+      settings.aggressiveInactiveSeconds,
+      defaults.aggressiveInactiveSeconds,
+      SETTINGS_LIMITS.aggressiveInactiveSeconds,
+    ),
+    sleepServerUrl: normalizeSleepServerUrl(settings.sleepServerUrl, defaults.sleepServerUrl),
+    requireLocalSleepServer: settingBoolean(settings.requireLocalSleepServer, defaults.requireLocalSleepServer),
+    restoreOnFocus: settingBoolean(settings.restoreOnFocus, defaults.restoreOnFocus),
+    powerAware: settingBoolean(settings.powerAware, defaults.powerAware),
+    skipPinned: settingBoolean(settings.skipPinned, defaults.skipPinned),
+    skipAudible: settingBoolean(settings.skipAudible, defaults.skipAudible),
+    protectDirtyForms: settingBoolean(settings.protectDirtyForms, defaults.protectDirtyForms),
     allowlist: normalizeAllowlist(settings.allowlist ?? DEFAULT_SETTINGS.allowlist),
     aggressiveList: normalizeAllowlist(settings.aggressiveList ?? DEFAULT_SETTINGS.aggressiveList),
     pressureDomains: normalizeAllowlist(settings.pressureDomains ?? DEFAULT_SETTINGS.pressureDomains),
   };
+}
+
+function clampSettingNumber(value, fallback, limits) {
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) {
+    return fallback;
+  }
+  return Math.min(limits.max, Math.max(limits.min, numericValue));
+}
+
+function settingBoolean(value, fallback) {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function normalizeSleepServerUrl(value, fallback) {
+  try {
+    const parsed = new URL(String(value || fallback));
+    if (
+      (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+      && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')
+    ) {
+      parsed.pathname = '/sleep';
+      parsed.search = '';
+      parsed.hash = '';
+      return parsed.toString();
+    }
+  } catch {
+    // Fall through to the known-safe localhost endpoint.
+  }
+  return fallback;
 }
 
 export function applyProfile(profile) {
@@ -117,7 +176,7 @@ export function applyPowerMode(settings = DEFAULT_SETTINGS, powerStatus = {}) {
 export function normalizeAllowlist(value) {
   const lines = Array.isArray(value) ? value : String(value ?? '').split(/\r?\n/);
 
-  return lines
+  return Array.from(new Set(lines
     .map((line) => String(line).trim())
     .filter((line) => line && !line.startsWith('#'))
     .map((line) => line.replace(/\s+#.*$/, '').trim())
@@ -136,7 +195,7 @@ export function normalizeAllowlist(value) {
           .toLowerCase();
       }
     })
-    .filter(Boolean);
+    .filter(Boolean)));
 }
 
 export function buildSleepPageUrl(runtimeBaseUrl, token, fallbackEntry = null) {
@@ -225,7 +284,8 @@ export function reconcileSleepingTabsWithOpenTabs(
 
   const nextSleepingTabs = {};
   for (const [storageToken, entry] of Object.entries(sleepingTabs ?? {})) {
-    if (!entry?.url) {
+    const entryUrl = normalizeRestorableUrl(entry?.url);
+    if (!entryUrl) {
       continue;
     }
 
@@ -236,18 +296,19 @@ export function reconcileSleepingTabsWithOpenTabs(
         ...entry,
         token,
         tabId: sleepPageTab.id,
+        url: entryUrl,
       };
       continue;
     }
 
     const matchingTab = tabsById.get(Number(entry.tabId));
     const tabUrl = normalizeRestorableUrl(matchingTab?.url);
-    const entryUrl = normalizeRestorableUrl(entry.url);
     if (matchingTab?.discarded === true && tabUrl && tabUrl === entryUrl) {
       nextSleepingTabs[storageToken] = {
         ...entry,
         token,
         tabId: matchingTab.id,
+        url: entryUrl,
       };
     }
   }
@@ -448,7 +509,8 @@ function collectReaderCandidates(value) {
 }
 
 export function normalizeRestorableUrl(value) {
-  for (const candidate of collectReaderCandidates(value)) {
+  const unwrappedValue = unwrapNestedSleepUrl(value);
+  for (const candidate of collectReaderCandidates(unwrappedValue)) {
     const restorable = parseHttpUrl(candidate);
     if (restorable) {
       return restorable;
@@ -456,6 +518,60 @@ export function normalizeRestorableUrl(value) {
   }
 
   return '';
+}
+
+function unwrapNestedSleepUrl(value) {
+  let current = String(value || '').trim();
+  const seen = new Set();
+
+  for (let depth = 0; depth < 8 && current && !seen.has(current); depth += 1) {
+    seen.add(current);
+    const next = unwrapKnownSleepUrl(current);
+    if (!next || next === current) {
+      break;
+    }
+    current = String(next).trim();
+  }
+
+  return current;
+}
+
+function unwrapKnownSleepUrl(value) {
+  try {
+    const parsed = new URL(value);
+    if (!isKnownSleepWrapper(parsed)) {
+      return '';
+    }
+
+    const hash = new URLSearchParams(parsed.hash.replace(/^#/, ''));
+    const legacyUrl = hash.get('url');
+    if (legacyUrl) {
+      return legacyUrl;
+    }
+
+    const fallback = hash.get('fallback');
+    if (!fallback) {
+      return '';
+    }
+
+    return JSON.parse(base64UrlDecode(fallback))?.url || '';
+  } catch {
+    return '';
+  }
+}
+
+function isKnownSleepWrapper(parsed) {
+  const protocol = parsed.protocol.toLowerCase();
+  const pathname = parsed.pathname.toLowerCase();
+  const host = parsed.hostname.toLowerCase();
+
+  if (protocol === 'file:' && pathname.endsWith('/local-sleeper.html')) {
+    return true;
+  }
+  if ((host === '127.0.0.1' || host === 'localhost') && pathname === '/sleep') {
+    return true;
+  }
+  return INTERNAL_PROTOCOLS.has(protocol) && pathname.endsWith('/sleep/sleep.html');
 }
 
 function base64UrlEncode(value) {
@@ -498,6 +614,32 @@ export function isYouTubeUrl(url) {
 
 export function shouldTreatYouTubeAsHighRisk(url, state = {}, settings = DEFAULT_SETTINGS) {
   return isYouTubeUrl(url) && Number(state.youtubeVideoCount ?? 0) >= Number(settings.youtubeVideoThreshold ?? 20);
+}
+
+export function mergeYouTubePageState(existingState = {}, incomingState = {}) {
+  const previousCount = Math.max(0, Number(existingState.youtubeVideoCount ?? 0));
+  const previousUrl = String(existingState.youtubeLastVideoUrl || '');
+  const incomingCount = Math.max(0, Number(incomingState.youtubeVideoCount ?? 0));
+  const incomingUrl = String(incomingState.youtubeLastVideoUrl || '');
+
+  if (!incomingUrl) {
+    return {
+      youtubeVideoCount: previousCount,
+      youtubeLastVideoUrl: previousUrl,
+    };
+  }
+
+  if (incomingUrl === previousUrl) {
+    return {
+      youtubeVideoCount: previousCount,
+      youtubeLastVideoUrl: previousUrl,
+    };
+  }
+
+  return {
+    youtubeVideoCount: Math.max(previousCount + 1, incomingCount),
+    youtubeLastVideoUrl: incomingUrl,
+  };
 }
 
 export function isAggressiveDomain(url, settings = DEFAULT_SETTINGS) {
@@ -609,6 +751,22 @@ export function isUrlSleepable(url) {
 
 export function isAllowlisted(url, allowlist = []) {
   return isDomainMatched(url, allowlist);
+}
+
+export function toggleAllowlistForHost(allowlist = [], host = '') {
+  const normalizedHost = String(host || '').trim().toLowerCase();
+  const normalizedAllowlist = normalizeAllowlist(allowlist);
+  if (!normalizedHost) {
+    return { enabled: false, allowlist: normalizedAllowlist };
+  }
+
+  const targetUrl = `https://${normalizedHost}/`;
+  const isEnabled = isAllowlisted(targetUrl, normalizedAllowlist);
+  const nextAllowlist = isEnabled
+    ? normalizedAllowlist.filter((entry) => !isAllowlisted(targetUrl, [entry]))
+    : Array.from(new Set([...normalizedAllowlist, normalizedHost])).sort();
+
+  return { enabled: !isEnabled, allowlist: nextAllowlist };
 }
 
 function isDomainMatched(url, patterns = []) {

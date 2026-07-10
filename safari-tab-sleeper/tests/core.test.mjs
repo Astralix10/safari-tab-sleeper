@@ -20,12 +20,14 @@ import {
   isPressureDomain,
   isSleepPageUrl,
   makeRuntimeMessageListener,
+  mergeYouTubePageState,
   normalizeAllowlist,
   normalizeRestorableUrl,
   reconcileSleepingTabsWithOpenTabs,
   shouldHealStuckSleepTab,
   shouldAutoRestoreSleepPage,
   shouldTreatYouTubeAsHighRisk,
+  toggleAllowlistForHost,
   mergeSettings,
 } from '../extension/background/core.js';
 
@@ -40,6 +42,26 @@ test('normalizeAllowlist trims comments, schemes, paths, and empty lines', () =>
     `),
     ['app.example.com', '*.internal.test', 'youtube.com'],
   );
+});
+
+test('mergeSettings clamps malformed values and keeps the sleep server on localhost', () => {
+  const settings = mergeSettings({
+    profile: 'unknown',
+    inactivityMinutes: 0,
+    youtubeVideoThreshold: 9999,
+    youtubeHighRiskInactiveSeconds: 'not-a-number',
+    aggressiveInactiveSeconds: -10,
+    sleepServerUrl: 'https://evil.example/collect',
+    skipPinned: 'false',
+  });
+
+  assert.equal(settings.profile, 'balanced');
+  assert.equal(settings.inactivityMinutes, 1);
+  assert.equal(settings.youtubeVideoThreshold, 500);
+  assert.equal(settings.youtubeHighRiskInactiveSeconds, 60);
+  assert.equal(settings.aggressiveInactiveSeconds, 10);
+  assert.equal(settings.sleepServerUrl, DEFAULT_SETTINGS.sleepServerUrl);
+  assert.equal(settings.skipPinned, true);
 });
 
 test('buildSleepDecision sleeps an inactive normal tab after the configured timeout', () => {
@@ -104,6 +126,17 @@ test('allowlisting YouTube protects the whole YouTube site family', () => {
   assert.equal(isAllowlisted('https://youtu.be/abc', allowlist), true);
   assert.equal(isAllowlisted('https://www.youtube-nocookie.com/embed/abc', allowlist), true);
   assert.equal(isAllowlisted('https://example.com/youtube.com', allowlist), false);
+});
+
+test('allowlist toggle removes the matching YouTube family without touching other sites', () => {
+  assert.deepEqual(
+    toggleAllowlistForHost(['www.youtube.com', '*.example.com'], 'music.youtube.com'),
+    { enabled: false, allowlist: ['*.example.com'] },
+  );
+  assert.deepEqual(
+    toggleAllowlistForHost(['*.example.com'], 'www.youtube.com'),
+    { enabled: true, allowlist: ['*.example.com', 'www.youtube.com'] },
+  );
 });
 
 test('profiles tune sleep timing and media behavior', () => {
@@ -229,6 +262,37 @@ test('YouTube high-risk tabs can sleep earlier after many same-tab video navigat
   });
 });
 
+test('YouTube navigation count survives page reloads and reset state', () => {
+  assert.deepEqual(
+    mergeYouTubePageState(
+      { youtubeVideoCount: 25, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=a' },
+      { youtubeVideoCount: 1, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=a' },
+    ),
+    { youtubeVideoCount: 25, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=a' },
+  );
+  assert.deepEqual(
+    mergeYouTubePageState(
+      { youtubeVideoCount: 25, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=a' },
+      { youtubeVideoCount: 1, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=b' },
+    ),
+    { youtubeVideoCount: 26, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=b' },
+  );
+  assert.deepEqual(
+    mergeYouTubePageState(
+      { youtubeVideoCount: 0, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=b' },
+      { youtubeVideoCount: 40, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=b' },
+    ),
+    { youtubeVideoCount: 0, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=b' },
+  );
+  assert.deepEqual(
+    mergeYouTubePageState(
+      { youtubeVideoCount: 3, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=b' },
+      { youtubeVideoCount: 12, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=c' },
+    ),
+    { youtubeVideoCount: 12, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=c' },
+  );
+});
+
 test('sleep page URLs use opaque tokens instead of leaking original URLs', () => {
   const runtimeUrl = 'safari-web-extension://example-id/';
   const token = 'abc123';
@@ -253,6 +317,42 @@ test('local sleep server URLs survive Safari session restore without leaking the
   assert.equal(url.startsWith('http://127.0.0.1:17654/sleep#fallback='), true);
   assert.equal(url.includes('mail.google.com'), false);
   assert.deepEqual(decodeSleepFallback(new URL(url).hash), entry);
+});
+
+test('nested local sleep URLs unwrap to the original page', () => {
+  const originalUrl = 'https://www.youtube.com/watch?v=original';
+  const firstSleepUrl = buildLocalSleepPageUrl('http://127.0.0.1:17654/sleep', {
+    token: 'first',
+    url: originalUrl,
+    title: 'Original video',
+    sleptAt: 1,
+    reason: 'memory-pressure',
+  });
+  const nestedSleepUrl = buildLocalSleepPageUrl('http://127.0.0.1:17654/sleep', {
+    token: 'second',
+    url: firstSleepUrl,
+    title: '[sleep] Original video',
+    sleptAt: 2,
+    reason: 'memory-pressure',
+  });
+
+  assert.equal(normalizeRestorableUrl(nestedSleepUrl), originalUrl);
+
+  assert.equal(
+    reconcileSleepingTabsWithOpenTabs(
+      {
+        second: {
+          token: 'second',
+          tabId: 42,
+          url: nestedSleepUrl,
+          title: '[sleep] Original video',
+        },
+      },
+      [{ id: 42, url: nestedSleepUrl }],
+      DEFAULT_SETTINGS,
+    ).second.url,
+    originalUrl,
+  );
 });
 
 test('sleep fallback restores Safari Reader URLs as normal web URLs', () => {

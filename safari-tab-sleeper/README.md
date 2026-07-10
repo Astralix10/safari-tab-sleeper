@@ -27,14 +27,18 @@ It targets the annoying case where long-lived tabs, especially YouTube, keep lar
 - Shows Safari/WebKit memory and current power mode in the popup.
 - Uses a local recovery archive for sleeping-tab URLs.
 - Automatically compacts duplicate archived URLs so the archive does not grow forever.
+- Rejects nested sleep-page URLs and atomically writes the recovery archive.
+- Serializes tab-state updates so simultaneous Safari events cannot erase counters or restore records.
+- Avoids redundant per-tab storage writes during the minute scan.
 - Runs a companion monitor that silently cleans heavy background tabs around 3 GB and sends normal Notification Center alerts around 5 GB.
+- Reports system swap for context but never attributes global swap to Safari or uses it alone to trigger cleanup.
 - Waits for extension settings sync before the companion performs forced memory cleanup.
 
 ## Honest Limitation
 
 Safari Web Extensions do not expose reliable per-tab memory usage. The extension cannot truthfully say “this tab uses 3 GB.”
 
-The companion watches Safari/WebKit processes and system swap as a whole. It can sleep likely-heavy background domains such as YouTube, Twitch, Netflix, Google Meet, Figma, Canva, Reddit, and X/Twitter. Exact process-to-tab attribution is not promised.
+The companion uses Safari/WebKit process RSS for cleanup thresholds and reports system swap only as context. It can sleep likely-heavy background domains such as YouTube, Twitch, Netflix, Google Meet, Figma, Canva, Reddit, and X/Twitter. Exact process-to-tab attribution is not promised.
 
 ## Project Layout
 

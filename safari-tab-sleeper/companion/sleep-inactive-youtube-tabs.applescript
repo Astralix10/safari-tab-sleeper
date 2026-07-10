@@ -14,6 +14,14 @@ on fileURLFromPath(posixPath)
 	return fileURLObject's absoluteString() as text
 end fileURLFromPath
 
+on sleepPageBaseURL(sleeperTarget)
+	set targetText to sleeperTarget as text
+	set textObject to current application's |NSString|'s stringWithString:targetText
+	set lowerTarget to textObject's lowercaseString() as text
+	if lowerTarget starts with "http://" or lowerTarget starts with "https://" then return targetText
+	return my fileURLFromPath(targetText)
+end sleepPageBaseURL
+
 on lowerText(theText)
 	set textObject to current application's |NSString|'s stringWithString:(theText as text)
 	return (textObject's lowercaseString()) as text
@@ -92,8 +100,8 @@ on isPressureURL(tabURL)
 end isPressureURL
 
 on run argv
-	if (count of argv) is 0 then error "Не передан путь к local-sleeper.html."
-	set sleeperPath to item 1 of argv
+	if (count of argv) is 0 then error "Не передан URL sleep-страницы."
+	set sleeperTarget to item 1 of argv
 	set allowlistPath to ""
 	if (count of argv) is greater than 1 then set allowlistPath to item 2 of argv
 	set sleptCount to 0
@@ -118,7 +126,7 @@ on run argv
 						on error
 							set originalTitle to originalURL
 						end try
-						set sleeperURL to (my fileURLFromPath(sleeperPath)) & "#url=" & (my encodeQueryComponent(originalURL)) & "&title=" & (my encodeQueryComponent(originalTitle)) & "&reason=memory&auto=1"
+					set sleeperURL to (my sleepPageBaseURL(sleeperTarget)) & "#url=" & (my encodeQueryComponent(originalURL)) & "&title=" & (my encodeQueryComponent(originalTitle)) & "&reason=memory-pressure&auto=1"
 						set URL of targetTab to sleeperURL
 						set sleptCount to sleptCount + 1
 					end if

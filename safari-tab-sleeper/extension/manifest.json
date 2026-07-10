@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Safari Tab Sleeper",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Усыпляет неактивные вкладки Safari, восстанавливает их при выборе и чистит тяжёлые вкладки при давлении на память.",
   "permissions": [
     "alarms",

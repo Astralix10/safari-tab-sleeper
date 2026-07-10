@@ -6,6 +6,7 @@ THRESHOLD_GB="3"
 ALERT_THRESHOLD_GB="5"
 INTERVAL_SECONDS="60"
 COOLDOWN_SECONDS="600"
+CLEANUP_COOLDOWN_SECONDS="300"
 SAMPLE_FILE=""
 SWAP_SAMPLE_FILE=""
 ONCE="0"
@@ -13,6 +14,7 @@ DRY_RUN="0"
 AUTO_SLEEP_PRESSURE_DOMAINS="1"
 PAUSE_FILE="$SCRIPT_DIR/pause-until"
 SETTINGS_READY_FILE="$SCRIPT_DIR/settings-ready"
+SLEEP_SERVER_URL="${SAFARI_TAB_SLEEPER_SLEEP_URL:-http://127.0.0.1:17654/sleep}"
 
 usage() {
   cat <<'EOF'
@@ -24,6 +26,8 @@ Options:
                      Порог пользовательских окон/уведомлений в ГБ. По умолчанию: 5
   --interval N       Интервал проверки в секундах. По умолчанию: 60
   --cooldown N       Минимальная пауза между диалогами. По умолчанию: 600
+  --cleanup-cooldown N
+                     Минимальная пауза между автоочистками. По умолчанию: 300
   --sample FILE      Читать sample ps вместо живого списка процессов.
   --swap-sample FILE Читать sample sysctl vm.swapusage вместо живого swap.
   --no-auto-pressure Не усыплять тяжёлые фоновые вкладки автоматически.
@@ -50,6 +54,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cooldown)
       COOLDOWN_SECONDS="$2"
+      shift 2
+      ;;
+    --cleanup-cooldown)
+      CLEANUP_COOLDOWN_SECONDS="$2"
       shift 2
       ;;
     --sample)
@@ -126,7 +134,7 @@ measure_memory() {
   swap_used_mb="$(measure_swap_mb)"
 
   collect_processes | awk -v threshold_kb="$threshold_kb" -v alert_threshold_kb="$alert_threshold_kb" -v swap_used_mb="$swap_used_mb" '
-    /Safari|WebKit|com\.apple\.WebKit/ {
+    {
       pid=$1
       rss=$2
       if (rss !~ /^[0-9]+$/) next
@@ -134,7 +142,7 @@ measure_memory() {
       for (i=3; i<=NF; i++) {
         command = command (i == 3 ? "" : " ") $i
       }
-      if (command ~ /memory-guard\.zsh/) next
+      if (command !~ /\/Safari\.app\/|\/Safari Technology Preview\.app\/|com\.apple\.Safari|\/WebKit\.framework\/|com\.apple\.WebKit/) next
       total += rss
       if (rss > max) {
         max = rss
@@ -145,8 +153,8 @@ measure_memory() {
     END {
       total_mb = int(total / 1024 + 0.5)
       max_mb = int(max / 1024 + 0.5)
-      over = (total >= threshold_kb || max >= threshold_kb || swap_used_mb * 1024 >= threshold_kb) ? 1 : 0
-      over_alert = (total >= alert_threshold_kb || max >= alert_threshold_kb || swap_used_mb * 1024 >= alert_threshold_kb) ? 1 : 0
+      over = (total >= threshold_kb || max >= threshold_kb) ? 1 : 0
+      over_alert = (total >= alert_threshold_kb || max >= alert_threshold_kb) ? 1 : 0
       printf "total_mb=%d max_mb=%d swap_used_mb=%d over_threshold=%d over_alert=%d top_pid=%s top_command=%s\n", total_mb, max_mb, swap_used_mb, over, over_alert, top_pid, top_command
     }
   '
@@ -220,10 +228,11 @@ sleep_inactive_pressure_tabs() {
     return 0
   fi
 
-  osascript "$SCRIPT_DIR/sleep-inactive-youtube-tabs.applescript" "$SCRIPT_DIR/local-sleeper.html" "$SCRIPT_DIR/allowlist.txt" 2>/dev/null || true
+  osascript "$SCRIPT_DIR/sleep-inactive-youtube-tabs.applescript" "$SLEEP_SERVER_URL" "$SCRIPT_DIR/allowlist.txt" 2>/dev/null || true
 }
 
 LAST_ALERT_AT="0"
+LAST_CLEANUP_AT="0"
 
 while true; do
   line="$(measure_memory)"
@@ -251,14 +260,15 @@ while true; do
 
   if [[ "$DRY_RUN" != "1" && "$over_threshold" == "1" ]]; then
     pressure_result=""
-    if [[ "$AUTO_SLEEP_PRESSURE_DOMAINS" == "1" ]]; then
+    if [[ "$AUTO_SLEEP_PRESSURE_DOMAINS" == "1" && $(( now - LAST_CLEANUP_AT )) -ge "$CLEANUP_COOLDOWN_SECONDS" ]]; then
+      LAST_CLEANUP_AT="$now"
       pressure_result="$(sleep_inactive_pressure_tabs)"
-      print -- "$(date '+%Y-%m-%d %H:%M:%S') pressure cleanup: $pressure_result"
       slept_count="$(field_from_line "$pressure_result" "slept_count")"
       slept_count="${slept_count:-0}"
       if [[ "$slept_count" == "0" ]]; then
         :
       else
+        print -- "$(date '+%Y-%m-%d %H:%M:%S') pressure cleanup: $pressure_result"
         sleep 2
         after_line="$(measure_memory)"
         after_total_mb="$(field_from_line "$after_line" "total_mb")"

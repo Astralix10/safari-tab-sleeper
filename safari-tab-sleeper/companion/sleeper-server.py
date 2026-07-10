@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import base64
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 from urllib.parse import parse_qs, urlparse
 
 HOST = "127.0.0.1"
@@ -33,6 +35,14 @@ YOUTUBE_ALLOWLIST_PATTERNS = (
     "youtube-nocookie.com",
     "*.youtube-nocookie.com",
 )
+TRUSTED_EXTENSION_ORIGIN_PREFIXES = (
+    "safari-web-extension://",
+    "safari-extension://",
+    "chrome-extension://",
+    "moz-extension://",
+)
+ARCHIVE_LOCK = threading.RLock()
+SETTINGS_LOCK = threading.RLock()
 
 SLEEP_HTML = r"""<!doctype html>
 <html lang="ru">
@@ -64,7 +74,7 @@ SLEEP_HTML = r"""<!doctype html>
   </main>
   <script>
     const params = new URLSearchParams(location.hash.slice(1));
-    const entry = decodeFallbackEntry(params.get('fallback'));
+    const entry = decodeFallbackEntry(params.get('fallback')) || legacySleepEntry(params);
     const title = document.querySelector('#title');
     const url = document.querySelector('#url');
     const restore = document.querySelector('#restore');
@@ -82,6 +92,20 @@ SLEEP_HTML = r"""<!doctype html>
       } catch {
         return null;
       }
+    }
+
+    function legacySleepEntry(hashParams) {
+      const originalUrl = hashParams.get('url');
+      if (!originalUrl) return null;
+      return {
+        token: '',
+        url: originalUrl,
+        title: hashParams.get('title') || originalUrl,
+        favIconUrl: '',
+        sleptAt: Date.now(),
+        reason: hashParams.get('reason') || 'memory-pressure',
+        autoRestore: hashParams.get('auto') === '1'
+      };
     }
 
     function reasonTag(reason) {
@@ -123,6 +147,32 @@ SLEEP_HTML = r"""<!doctype html>
       }
     }
 
+    function unwrapSleepUrl(value) {
+      let current = String(value || '').trim();
+      const seen = new Set();
+      for (let depth = 0; depth < 8 && current && !seen.has(current); depth += 1) {
+        seen.add(current);
+        try {
+          const parsed = new URL(current);
+          const protocol = parsed.protocol.toLowerCase();
+          const path = parsed.pathname.toLowerCase();
+          const host = parsed.hostname.toLowerCase();
+          const isWrapper = (protocol === 'file:' && path.endsWith('/local-sleeper.html'))
+            || ((host === '127.0.0.1' || host === 'localhost') && path === '/sleep')
+            || (protocol.includes('extension:') && path.endsWith('/sleep/sleep.html'));
+          if (!isWrapper) break;
+          const sleepParams = new URLSearchParams(parsed.hash.slice(1));
+          const fallback = decodeFallbackEntry(sleepParams.get('fallback'));
+          const next = sleepParams.get('url') || fallback?.url || '';
+          if (!next) break;
+          current = next;
+        } catch {
+          break;
+        }
+      }
+      return current;
+    }
+
     function normalizeRestorableUrl(value) {
       const candidates = [];
       const add = (candidate) => {
@@ -130,8 +180,9 @@ SLEEP_HTML = r"""<!doctype html>
         if (text && !candidates.includes(text)) candidates.push(text);
       };
 
-      add(value);
-      let decoded = String(value || '').trim();
+      const unwrapped = unwrapSleepUrl(value);
+      add(unwrapped);
+      let decoded = unwrapped;
       for (let i = 0; i < 3; i += 1) {
         const next = decodeURIComponentSafely(decoded);
         if (next === decoded) break;
@@ -253,6 +304,13 @@ def format_mb(value):
     return f"{value} МБ"
 
 
+def is_safari_process(command):
+    return bool(re.search(
+        r"/Safari\.app/|/Safari Technology Preview\.app/|com\.apple\.Safari|/WebKit\.framework/|com\.apple\.WebKit",
+        str(command or ""),
+    ))
+
+
 def collect_memory_status():
     total_kb = 0
     max_kb = 0
@@ -266,9 +324,7 @@ def collect_memory_status():
             continue
 
         pid, rss_text, command = parts
-        if not re.search(r"Safari|WebKit|com\.apple\.WebKit", command):
-            continue
-        if "memory-guard.zsh" in command:
+        if not is_safari_process(command):
             continue
 
         try:
@@ -293,12 +349,12 @@ def collect_memory_status():
         "totalMb": total_mb,
         "maxMb": max_mb,
         "swapUsedMb": swap_used_mb,
-        "overThreshold": total_kb >= pressure_kb or max_kb >= pressure_kb or swap_used_mb * 1024 >= pressure_kb,
-        "overAlert": total_kb >= alert_kb or max_kb >= alert_kb or swap_used_mb * 1024 >= alert_kb,
+        "overThreshold": total_kb >= pressure_kb or max_kb >= pressure_kb,
+        "overAlert": total_kb >= alert_kb or max_kb >= alert_kb,
         "topPid": top_pid,
         "topCommand": top_command,
         "label": f"Safari/WebKit: {format_mb(total_mb)}",
-        "details": f"Пик процесса {format_mb(max_mb)} · swap {format_mb(swap_used_mb)}",
+        "details": f"Пик процесса {format_mb(max_mb)} · системный swap {format_mb(swap_used_mb)}",
     }
 
 
@@ -366,19 +422,25 @@ def is_youtube_family_domain(value):
 
 
 def write_allowlist(patterns):
-    allowlist_dir = os.path.dirname(ALLOWLIST_PATH)
-    if allowlist_dir:
-        os.makedirs(allowlist_dir, exist_ok=True)
-    with open(ALLOWLIST_PATH, "w", encoding="utf-8") as file:
-        file.write("".join(f"{pattern}\n" for pattern in patterns))
+    with SETTINGS_LOCK:
+        allowlist_dir = os.path.dirname(ALLOWLIST_PATH)
+        if allowlist_dir:
+            os.makedirs(allowlist_dir, exist_ok=True)
+        temp_path = f"{ALLOWLIST_PATH}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as file:
+            file.write("".join(f"{pattern}\n" for pattern in patterns))
+        os.replace(temp_path, ALLOWLIST_PATH)
 
 
 def write_settings_ready():
-    ready_dir = os.path.dirname(SETTINGS_READY_PATH)
-    if ready_dir:
-        os.makedirs(ready_dir, exist_ok=True)
-    with open(SETTINGS_READY_PATH, "w", encoding="utf-8") as file:
-        file.write("ready\n")
+    with SETTINGS_LOCK:
+        if settings_ready():
+            return
+        ready_dir = os.path.dirname(SETTINGS_READY_PATH)
+        if ready_dir:
+            os.makedirs(ready_dir, exist_ok=True)
+        with open(SETTINGS_READY_PATH, "w", encoding="utf-8") as file:
+            file.write("ready\n")
 
 
 def settings_ready():
@@ -386,17 +448,20 @@ def settings_ready():
 
 
 def read_allowlist():
-    try:
-        with open(ALLOWLIST_PATH, "r", encoding="utf-8") as file:
-            return sanitize_domain_patterns(file.read().splitlines())
-    except Exception:
-        return []
+    with SETTINGS_LOCK:
+        try:
+            with open(ALLOWLIST_PATH, "r", encoding="utf-8") as file:
+                return sanitize_domain_patterns(file.read().splitlines())
+        except Exception:
+            return []
 
 
 def save_companion_settings(settings):
     allowlist = sanitize_domain_patterns(settings.get("allowlist") if isinstance(settings, dict) else [])
-    write_allowlist(allowlist)
-    write_settings_ready()
+    with SETTINGS_LOCK:
+        if read_allowlist() != allowlist:
+            write_allowlist(allowlist)
+        write_settings_ready()
     return {
         "ok": True,
         "ready": True,
@@ -404,10 +469,51 @@ def save_companion_settings(settings):
     }
 
 
+def is_known_sleep_wrapper(parsed):
+    scheme = str(parsed.scheme or "").lower()
+    hostname = str(parsed.hostname or "").lower()
+    path = str(parsed.path or "").lower()
+    if scheme == "file" and path.endswith("/local-sleeper.html"):
+        return True
+    if hostname in ("127.0.0.1", "localhost") and path == "/sleep":
+        return True
+    return scheme in ("safari-web-extension", "safari-extension", "chrome-extension", "moz-extension") and path.endswith("/sleep/sleep.html")
+
+
+def decode_fallback_url(encoded):
+    try:
+        value = str(encoded or "")
+        padded = value + "=" * (-len(value) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        return str(payload.get("url") or "") if isinstance(payload, dict) else ""
+    except Exception:
+        return ""
+
+
+def unwrap_sleep_url(value):
+    current = str(value or "").strip()
+    seen = set()
+    for _ in range(8):
+        if not current or current in seen:
+            break
+        seen.add(current)
+        parsed = urlparse(current)
+        if not is_known_sleep_wrapper(parsed):
+            break
+        params = parse_qs(parsed.fragment)
+        next_url = (params.get("url") or [""])[0]
+        if not next_url:
+            next_url = decode_fallback_url((params.get("fallback") or [""])[0])
+        if not next_url:
+            return ""
+        current = next_url.strip()
+    return current
+
+
 def normalize_archive_url(value):
-    text = str(value or "").strip()
+    text = unwrap_sleep_url(value)
     parsed = urlparse(text)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or is_known_sleep_wrapper(parsed):
         return ""
     return parsed.geturl()
 
@@ -433,13 +539,14 @@ def sanitize_archive_entry(entry):
 
 
 def load_archive_entries():
-    try:
-        with open(ARCHIVE_PATH, "r", encoding="utf-8") as file:
-            data = json.load(file)
-        entries = data.get("entries", []) if isinstance(data, dict) else []
-        return [entry for entry in entries if sanitize_archive_entry(entry)]
-    except Exception:
-        return []
+    with ARCHIVE_LOCK:
+        try:
+            with open(ARCHIVE_PATH, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            entries = data.get("entries", []) if isinstance(data, dict) else []
+            return [entry for entry in entries if sanitize_archive_entry(entry)]
+        except Exception:
+            return []
 
 
 def compact_archive_entries(entries):
@@ -465,37 +572,57 @@ def compact_archive_entries(entries):
 
 
 def save_archive_entries(entries):
-    archive_dir = os.path.dirname(ARCHIVE_PATH)
-    if archive_dir:
-        os.makedirs(archive_dir, exist_ok=True)
-    compacted = compact_archive_entries(entries)
-    with open(ARCHIVE_PATH, "w", encoding="utf-8") as file:
-        json.dump({"entries": compacted}, file, ensure_ascii=False, indent=2)
-    return compacted
+    with ARCHIVE_LOCK:
+        archive_dir = os.path.dirname(ARCHIVE_PATH)
+        if archive_dir:
+            os.makedirs(archive_dir, exist_ok=True)
+        compacted = compact_archive_entries(entries)
+        temp_path = f"{ARCHIVE_PATH}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as file:
+            json.dump({"entries": compacted}, file, ensure_ascii=False, indent=2)
+        os.replace(temp_path, ARCHIVE_PATH)
+        return compacted
 
 
 def archive_entry(entry):
-    clean_entry = sanitize_archive_entry(entry)
-    if not clean_entry:
-        return None, save_archive_entries(load_archive_entries())
+    with ARCHIVE_LOCK:
+        clean_entry = sanitize_archive_entry(entry)
+        if not clean_entry:
+            return None, save_archive_entries(load_archive_entries())
 
-    entries = [
-        existing for existing in load_archive_entries()
-        if existing.get("token") != clean_entry["token"]
-    ]
-    entries.append(clean_entry)
-    return clean_entry, save_archive_entries(entries)
+        entries = [
+            existing for existing in load_archive_entries()
+            if existing.get("token") != clean_entry["token"]
+        ]
+        entries.append(clean_entry)
+        return clean_entry, save_archive_entries(entries)
 
 
 def find_archived_entry(token):
-    entries = save_archive_entries(load_archive_entries())
-    for entry in entries:
-        if entry.get("token") == token:
-            return entry, entries
-    return None, entries
+    with ARCHIVE_LOCK:
+        entries = save_archive_entries(load_archive_entries())
+        for entry in entries:
+            if entry.get("token") == token:
+                return entry, entries
+        return None, entries
 
 
 class Handler(BaseHTTPRequestHandler):
+    def request_origin(self):
+        return str(self.headers.get("Origin") or "").strip()
+
+    def is_trusted_origin(self, origin=None):
+        candidate = self.request_origin() if origin is None else str(origin or "").strip()
+        if not candidate:
+            return True
+        return candidate.startswith(TRUSTED_EXTENSION_ORIGIN_PREFIXES)
+
+    def send_cors_headers(self):
+        origin = self.request_origin()
+        if origin and self.is_trusted_origin(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
@@ -524,17 +651,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/favicon.ico":
             self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_cors_headers()
             self.end_headers()
             return
         self.send_text(404, "not found\n", "text/plain; charset=utf-8")
 
     def do_POST(self):
+        if not self.is_trusted_origin():
+            self.send_json(403, {"ok": False, "reason": "untrusted-origin"})
+            return
+
         path = urlparse(self.path).path
         if path == "/settings":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                raw_body = self.rfile.read(min(length, 256 * 1024))
+                raw_body = self.rfile.read(max(0, min(length, 256 * 1024)))
                 body = json.loads(raw_body.decode("utf-8") or "{}")
                 self.send_json(200, save_companion_settings(body))
             except Exception as error:
@@ -547,7 +678,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            raw_body = self.rfile.read(min(length, 256 * 1024))
+            raw_body = self.rfile.read(max(0, min(length, 256 * 1024)))
             body = json.loads(raw_body.decode("utf-8") or "{}")
             entry, entries = archive_entry(body.get("entry"))
             if not entry:
@@ -558,10 +689,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(500, {"ok": False, "reason": str(error)})
 
     def do_OPTIONS(self):
+        if not self.is_trusted_origin():
+            self.send_response(403)
+            self.end_headers()
+            return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_cors_headers()
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Headers", "content-type")
         self.end_headers()
 
     def send_text(self, status, body, content_type):
@@ -570,7 +705,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_cors_headers()
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -580,7 +715,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_cors_headers()
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -589,6 +724,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    save_archive_entries(load_archive_entries())
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Safari Tab Sleeper server listening on http://{HOST}:{PORT}/sleep", flush=True)
     server.serve_forever()

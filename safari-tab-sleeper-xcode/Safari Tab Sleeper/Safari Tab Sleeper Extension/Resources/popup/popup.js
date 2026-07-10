@@ -95,7 +95,7 @@ function renderMemoryStatus(status) {
   }
 
   elements.memoryUsage.textContent = formatMemory(status.totalMb);
-  elements.memoryDetails.textContent = `Пик процесса ${formatMemory(status.maxMb)} · swap ${formatMemory(status.swapUsedMb)}`;
+  elements.memoryDetails.textContent = `Пик процесса ${formatMemory(status.maxMb)} · системный swap ${formatMemory(status.swapUsedMb)}`;
 }
 
 function render(state) {

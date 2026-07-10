@@ -14,9 +14,17 @@ on fileURLFromPath(posixPath)
 	return fileURLObject's absoluteString() as text
 end fileURLFromPath
 
+on sleepPageBaseURL(sleeperTarget)
+	set targetText to sleeperTarget as text
+	set textObject to current application's |NSString|'s stringWithString:targetText
+	set lowerTarget to textObject's lowercaseString() as text
+	if lowerTarget starts with "http://" or lowerTarget starts with "https://" then return targetText
+	return my fileURLFromPath(targetText)
+end sleepPageBaseURL
+
 on run argv
-	if (count of argv) is 0 then error "Не передан путь к local-sleeper.html."
-	set sleeperPath to item 1 of argv
+	if (count of argv) is 0 then error "Не передан URL sleep-страницы."
+	set sleeperTarget to item 1 of argv
 	
 	tell application "Safari"
 		if it is not running then error "Safari не запущен."
@@ -30,7 +38,7 @@ on run argv
 		end try
 	end tell
 	
-set sleeperURL to (my fileURLFromPath(sleeperPath)) & "#url=" & (my encodeQueryComponent(originalURL)) & "&title=" & (my encodeQueryComponent(originalTitle)) & "&reason=manual"
+set sleeperURL to (my sleepPageBaseURL(sleeperTarget)) & "#url=" & (my encodeQueryComponent(originalURL)) & "&title=" & (my encodeQueryComponent(originalTitle)) & "&reason=manual-current-tab&auto=0"
 	
 	tell application "Safari"
 		set URL of current tab of front window to sleeperURL

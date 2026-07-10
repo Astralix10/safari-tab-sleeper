@@ -17,6 +17,8 @@ It helps keep Safari under control when long-lived tabs, especially YouTube, Twi
 - Keeps original tab titles and favicons visible with `[sleep]` prefixes.
 - Backs up sleeping-tab restore data in a local archive.
 - Compacts duplicate archived URLs so old repeated links do not grow forever.
+- Unwraps legacy and nested sleep links before restoring or archiving them.
+- Serializes Safari event writes so concurrent tab updates cannot erase state.
 - Syncs the never-sleep allowlist into the companion so memory-pressure cleanup respects protected sites.
 - Treats a YouTube allowlist entry as the whole YouTube family, including `youtu.be` and embeds.
 - Cleans likely-heavy background tabs under Safari/WebKit memory pressure.
@@ -76,7 +78,7 @@ The companion listens only on `127.0.0.1:17654`.
 
 ## Memory Model
 
-Safari does not expose reliable per-tab memory usage to WebExtensions. This project watches Safari/WebKit process memory and swap pressure, then acts on likely-heavy background tabs. It avoids claiming exact per-tab RAM.
+Safari does not expose reliable per-tab memory usage to WebExtensions. This project uses Safari/WebKit process RSS for cleanup decisions and displays system swap only as context. It acts on likely-heavy background tabs without claiming exact per-tab RAM.
 
 ## License
 

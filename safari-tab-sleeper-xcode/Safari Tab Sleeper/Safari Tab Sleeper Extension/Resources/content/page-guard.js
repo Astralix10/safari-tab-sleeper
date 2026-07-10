@@ -44,11 +44,12 @@
     }
 
     lastHref = href;
+    dirty = false;
     if (isYouTubeWatchUrl(href) && href !== youtubeLastVideoUrl) {
       youtubeVideoCount += 1;
       youtubeLastVideoUrl = href;
-      sendState();
     }
+    sendState();
   }
 
   document.addEventListener('input', (event) => {
@@ -91,6 +92,13 @@
         youtubeVideoCount,
         youtubeLastVideoUrl,
       });
+    }
+
+    if (message?.type === 'tab-sleeper:reset-youtube-counter') {
+      youtubeVideoCount = 0;
+      youtubeLastVideoUrl = isYouTubeWatchUrl(location.href) ? location.href : '';
+      sendState();
+      return Promise.resolve({ ok: true });
     }
 
     return false;
