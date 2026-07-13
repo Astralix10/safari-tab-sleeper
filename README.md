@@ -62,19 +62,18 @@ Then open the app once and enable the extension in Safari Settings -> Extensions
 
 ## Companion
 
-Install the localhost sleep server and memory guard:
+Install the memory guard with its self-healing localhost sleep server:
 
 ```zsh
 cd safari-tab-sleeper
 ./companion/install-launch-agent.zsh
 ```
 
-This starts:
+This starts one persistent LaunchAgent:
 
-- `com.local.safari-tab-sleeper.sleep-server`
 - `com.local.safari-tab-sleeper.memory-guard`
 
-The companion listens only on `127.0.0.1:17654`.
+The monitor starts and restarts the companion server as needed. The companion listens only on `127.0.0.1:17654`.
 
 ## Memory Model
 

@@ -81,7 +81,7 @@ Open the app once, then enable Safari Tab Sleeper in Safari Settings -> Extensio
 
 ## Run The Companion
 
-Install the memory guard and localhost sleep server as LaunchAgents:
+Install the memory guard and its self-healing localhost sleep server:
 
 ```zsh
 chmod +x companion/*.zsh
@@ -91,7 +91,8 @@ chmod +x companion/*.zsh
 This installs:
 
 - `com.local.safari-tab-sleeper.memory-guard`
-- `com.local.safari-tab-sleeper.sleep-server`
+
+The memory guard starts and restarts `sleeper-server.py` when the localhost health check fails. Older standalone `com.local.safari-tab-sleeper.sleep-server` registrations are removed during installation.
 
 Uninstall:
 

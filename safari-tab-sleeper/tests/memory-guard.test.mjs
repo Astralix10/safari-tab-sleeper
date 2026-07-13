@@ -144,3 +144,18 @@ test('memory guard waits for extension settings sync before pressure sleeping', 
   assert.equal(script.includes('settings_are_synced()'), true);
   assert.equal(script.includes('settings_pending=1'), true);
 });
+
+test('memory guard self-heals the localhost sleep server', async () => {
+  const [memoryGuard, installer] = await Promise.all([
+    readFile(new URL('../companion/memory-guard.zsh', import.meta.url), 'utf8'),
+    readFile(new URL('../companion/install-launch-agent.zsh', import.meta.url), 'utf8'),
+  ]);
+
+  assert.equal(memoryGuard.includes('ensure_sleep_server()'), true);
+  assert.equal(memoryGuard.includes('sleep_server_is_healthy()'), true);
+  assert.equal(memoryGuard.includes('ensure_sleep_server || true'), true);
+  assert.equal(memoryGuard.includes('sleep_with_server_watchdog()'), true);
+  assert.equal(memoryGuard.includes('step=5'), true);
+  assert.equal(installer.includes('launchctl bootstrap "gui/$(id -u)" "$SERVER_PLIST"'), false);
+  assert.equal(installer.includes('rm -f "$SERVER_PLIST"'), true);
+});

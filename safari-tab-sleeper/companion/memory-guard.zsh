@@ -15,6 +15,11 @@ AUTO_SLEEP_PRESSURE_DOMAINS="1"
 PAUSE_FILE="$SCRIPT_DIR/pause-until"
 SETTINGS_READY_FILE="$SCRIPT_DIR/settings-ready"
 SLEEP_SERVER_URL="${SAFARI_TAB_SLEEPER_SLEEP_URL:-http://127.0.0.1:17654/sleep}"
+SLEEP_SERVER_HEALTH_URL="${SAFARI_TAB_SLEEPER_HEALTH_URL:-${SLEEP_SERVER_URL%/sleep}/health}"
+SLEEP_SERVER_SCRIPT="$SCRIPT_DIR/sleeper-server.py"
+SLEEP_SERVER_LOG="$HOME/Library/Logs/safari-tab-sleeper-server.log"
+SLEEP_SERVER_ERROR_LOG="$HOME/Library/Logs/safari-tab-sleeper-server.err.log"
+PYTHON_BIN="${SAFARI_TAB_SLEEPER_PYTHON:-/usr/bin/python3}"
 
 usage() {
   cat <<'EOF'
@@ -188,6 +193,53 @@ settings_are_synced() {
   [[ -f "$SETTINGS_READY_FILE" ]]
 }
 
+sleep_server_is_healthy() {
+  /usr/bin/curl --silent --fail --max-time 1 "$SLEEP_SERVER_HEALTH_URL" >/dev/null 2>&1
+}
+
+ensure_sleep_server() {
+  if sleep_server_is_healthy; then
+    return 0
+  fi
+
+  if [[ ! -x "$PYTHON_BIN" || ! -f "$SLEEP_SERVER_SCRIPT" ]]; then
+    print "Safari Tab Sleeper: не найден Python или sleeper-server.py" >&2
+    return 1
+  fi
+
+  "$PYTHON_BIN" "$SLEEP_SERVER_SCRIPT" </dev/null >>"$SLEEP_SERVER_LOG" 2>>"$SLEEP_SERVER_ERROR_LOG" &!
+
+  local attempt
+  for attempt in {1..20}; do
+    sleep 0.1
+    if sleep_server_is_healthy; then
+      return 0
+    fi
+  done
+
+  print "Safari Tab Sleeper: сервер не запустился на $SLEEP_SERVER_HEALTH_URL" >&2
+  return 1
+}
+
+sleep_with_server_watchdog() {
+  local remaining="$1"
+  local step
+
+  while (( remaining > 0 )); do
+    step=5
+    if (( remaining < step )); then
+      step="$remaining"
+    fi
+
+    sleep "$step"
+    remaining=$(( remaining - step ))
+
+    if [[ "$DRY_RUN" != "1" ]]; then
+      ensure_sleep_server || true
+    fi
+  done
+}
+
 show_memory_alert_notification() {
   local total_mb="$1"
   local max_mb="$2"
@@ -235,6 +287,10 @@ LAST_ALERT_AT="0"
 LAST_CLEANUP_AT="0"
 
 while true; do
+  if [[ "$DRY_RUN" != "1" ]]; then
+    ensure_sleep_server || true
+  fi
+
   line="$(measure_memory)"
 
   if [[ "$DRY_RUN" == "1" ]]; then
@@ -254,7 +310,7 @@ while true; do
     if [[ "$ONCE" == "1" ]]; then
       exit 0
     fi
-    sleep "$INTERVAL_SECONDS"
+    sleep_with_server_watchdog "$INTERVAL_SECONDS"
     continue
   fi
 
@@ -280,7 +336,7 @@ while true; do
         if [[ "$ONCE" == "1" ]]; then
           exit 0
         fi
-        sleep "$INTERVAL_SECONDS"
+        sleep_with_server_watchdog "$INTERVAL_SECONDS"
         continue
       fi
     fi
@@ -295,5 +351,5 @@ while true; do
     exit 0
   fi
 
-  sleep "$INTERVAL_SECONDS"
+  sleep_with_server_watchdog "$INTERVAL_SECONDS"
 done
