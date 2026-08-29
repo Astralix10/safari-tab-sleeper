@@ -1,5 +1,12 @@
 import { runtimeApi as api, sendRuntimeMessage } from '../shared/messaging.js';
-import { isAllowlisted } from '../background/core.js';
+import {
+  hostnameFromUrl,
+  isAllowlisted,
+  mergeSettings,
+  setAllowlistForHost,
+} from '../background/core.js';
+
+const SETTINGS_SCHEMA_VERSION = 2;
 
 const elements = {
   statusTitle: document.querySelector('#status-title'),
@@ -23,8 +30,96 @@ const elements = {
 
 let currentState = null;
 
+function setAllowlistToggleValue(enabled) {
+  const value = Boolean(enabled);
+  elements.allowlistToggle.dataset.enabled = String(value);
+  elements.allowlistToggle.setAttribute('aria-pressed', String(value));
+}
+
+function getAllowlistToggleValue() {
+  return elements.allowlistToggle.dataset.enabled === 'true';
+}
+
 async function send(type, payload = {}) {
   return sendRuntimeMessage({ type, ...payload });
+}
+
+function activeTabHintFromState(state = currentState) {
+  return {
+    currentTabId: state?.tab?.id,
+    currentUrl: state?.tab?.url || state?.state?.pageUrl || '',
+    currentTitle: state?.tab?.title || state?.state?.pageTitle || '',
+  };
+}
+
+async function readActiveTabHint(fallbackState = currentState) {
+  const fallback = activeTabHintFromState(fallbackState);
+
+  try {
+    const companionTab = await readCompanionActiveTab(fallbackState?.settings);
+    if (companionTab?.url) {
+      let matchingTab = null;
+      try {
+        const tabs = await api.tabs.query({});
+        matchingTab = tabs.find((candidate) => candidate.url === companionTab.url) ?? null;
+      } catch {
+        // The URL from the front Safari window is still authoritative for the switch.
+      }
+
+      return {
+        currentTabId: matchingTab?.id,
+        currentUrl: companionTab.url,
+        currentTitle: companionTab.title || matchingTab?.title || fallback.currentTitle,
+        source: 'companion',
+      };
+    }
+  } catch {
+    // Fall back to Safari WebExtension APIs while the companion is restarting.
+  }
+
+  try {
+    const [tab] = await api.tabs.query({ active: true, currentWindow: true });
+    if (tab?.id != null) {
+      return {
+        currentTabId: tab.id,
+        currentUrl: tab.url || fallback.currentUrl,
+        currentTitle: tab.title || fallback.currentTitle,
+      };
+    }
+  } catch {
+    // Safari popovers are not always associated with currentWindow.
+  }
+
+  try {
+    const window = await api.windows.getLastFocused({ populate: true });
+    const tab = window?.tabs?.find((candidate) => candidate.active);
+    if (tab?.id != null) {
+      return {
+        currentTabId: tab.id,
+        currentUrl: tab.url || fallback.currentUrl,
+        currentTitle: tab.title || fallback.currentTitle,
+      };
+    }
+  } catch {
+    // Keep the last state when Safari withholds focused-window details.
+  }
+
+  if (api.tabs.getSelected) {
+    try {
+      const tab = await api.tabs.getSelected();
+      if (tab?.id != null) {
+        return {
+          currentTabId: tab.id,
+          currentUrl: tab.url || fallback.currentUrl,
+          currentTitle: tab.title || fallback.currentTitle,
+        };
+      }
+    } catch {
+      // Safari keeps this legacy Chromium API on some releases only.
+    }
+  }
+
+  return fallback;
 }
 
 function hostFromUrl(url) {
@@ -59,14 +154,125 @@ function formatMemory(mb) {
 }
 
 function memoryEndpointFromSettings(settings = {}) {
+  return companionEndpointFromSettings(settings, '/memory');
+}
+
+function companionEndpointFromSettings(settings = {}, pathname = '/') {
   try {
     const url = new URL(settings.sleepServerUrl || 'http://127.0.0.1:17654/sleep');
-    url.pathname = '/memory';
+    url.pathname = pathname;
     url.search = '';
     url.hash = '';
     return url.toString();
   } catch {
-    return 'http://127.0.0.1:17654/memory';
+    return `http://127.0.0.1:17654${pathname}`;
+  }
+}
+
+async function readCompanionActiveTab(settings = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1200);
+  try {
+    const response = await fetch(companionEndpointFromSettings(settings, '/active-tab'), {
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const result = await response.json();
+    return result?.ok && hostnameFromUrl(result.url) ? result : null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readStoredSettings(fallback = {}) {
+  try {
+    const stored = await api.storage.local.get('settings');
+    return mergeSettings(stored.settings ?? fallback);
+  } catch {
+    return mergeSettings(fallback);
+  }
+}
+
+async function enrichPopupState(state) {
+  const [hint, settings] = await Promise.all([
+    readActiveTabHint(state),
+    readStoredSettings(state.settings),
+  ]);
+  const hintedUrl = hint.currentUrl || '';
+  const currentHost = hostnameFromUrl(hintedUrl) || state.currentHost;
+  if (!currentHost) {
+    return { ...state, settings };
+  }
+
+  return {
+    ...state,
+    settings,
+    currentHost,
+    tab: {
+      ...(state.tab ?? {}),
+      id: hint.currentTabId ?? state.tab?.id,
+      url: hintedUrl || state.tab?.url,
+      title: hint.currentTitle || state.tab?.title || hintedUrl,
+    },
+    activeTabDebug: {
+      ...(state.activeTabDebug ?? {}),
+      source: hint.source || state.activeTabDebug?.source || 'popup',
+    },
+  };
+}
+
+async function setCurrentSiteAllowlisted(enabled) {
+  const hint = await readActiveTabHint();
+  const host = hostnameFromUrl(hint.currentUrl || currentState?.tab?.url);
+  if (!host) {
+    return { ok: false, reason: 'missing-domain' };
+  }
+
+  const settings = await readStoredSettings(currentState?.settings);
+  const result = setAllowlistForHost(settings.allowlist ?? [], host, enabled);
+  const nextSettings = mergeSettings({ ...settings, allowlist: result.allowlist });
+  await api.storage.local.set({
+    settings: nextSettings,
+    settingsSchemaVersion: SETTINGS_SCHEMA_VERSION,
+  });
+
+  try {
+    await send('tab-sleeper:set-allowlist-current', { ...hint, enabled });
+  } catch {
+    // Direct storage remains authoritative if Safari is restarting the worker.
+  }
+
+  currentState = {
+    ...currentState,
+    settings: nextSettings,
+    currentHost: host,
+  };
+  return { ok: true, enabled: result.enabled, domain: host };
+}
+
+async function updateAllowlistToggle(enabled) {
+  const previousValue = !enabled;
+  elements.allowlistToggle.disabled = true;
+  try {
+    const result = await setCurrentSiteAllowlisted(enabled);
+    if (!result.ok) {
+      setAllowlistToggleValue(previousValue);
+      elements.tabMeta.textContent = `Не удалось сохранить: ${result.reason}`;
+      return;
+    }
+
+    setAllowlistToggleValue(result.enabled);
+    elements.tabMeta.textContent = result.enabled
+      ? `${result.domain} · сайт не будет усыпляться`
+      : `${result.domain} · обычный режим усыпления`;
+  } catch (error) {
+    setAllowlistToggleValue(previousValue);
+    elements.tabMeta.textContent = `Не удалось сохранить: ${String(error?.message ?? error)}`;
+  } finally {
+    elements.allowlistToggle.disabled = false;
   }
 }
 
@@ -87,6 +293,27 @@ async function readMemoryStatus(settings = {}) {
   }
 }
 
+async function readPowerStatus(settings = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1200);
+  try {
+    const response = await fetch(companionEndpointFromSettings(settings, '/power'), {
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function sleepCurrentWithFallback() {
+  return send('tab-sleeper:sleep-current', await readActiveTabHint());
+}
+
 function renderMemoryStatus(status) {
   if (!status?.ok) {
     elements.memoryUsage.textContent = 'Недоступно';
@@ -96,6 +323,12 @@ function renderMemoryStatus(status) {
 
   elements.memoryUsage.textContent = formatMemory(status.totalMb);
   elements.memoryDetails.textContent = `Пик процесса ${formatMemory(status.maxMb)} · системный swap ${formatMemory(status.swapUsedMb)}`;
+}
+
+function renderPowerStatus(status) {
+  elements.powerStatus.textContent = status?.ok && status.label
+    ? status.label
+    : 'Питание: недоступно';
 }
 
 function render(state) {
@@ -114,9 +347,16 @@ function render(state) {
   elements.tabTitle.textContent = state.isSleeping
     ? state.sleepEntry?.title || 'Спящая вкладка'
     : tab.title || hostFromUrl(tab.url);
+  const protectedFromSleep = !state.isSleeping && isCurrentHostAllowlisted(state);
   elements.tabMeta.textContent = state.isSleeping
     ? `Причина: ${state.reasonLabel}`
-    : `${hostFromUrl(tab.url)} · видео YouTube в этой вкладке: ${youtubeCount}`;
+    : protectedFromSleep
+      ? `${hostFromUrl(tab.url)} · защита от усыпления включена`
+      : `${hostFromUrl(tab.url)} · видео YouTube в этой вкладке: ${youtubeCount}`;
+  if (!state.isSleeping && !state.currentHost) {
+    const debug = state.activeTabDebug ?? {};
+    elements.tabMeta.textContent = `Safari не передал адрес · ${debug.source || 'unknown'} · id ${debug.tabId ?? 'нет'} · URL ${debug.tabUrl ? 'есть' : 'нет'} · state ${debug.statePageUrl || debug.stateUrl ? 'есть' : 'нет'}`;
+  }
 
   elements.sleepCurrent.hidden = state.isSleeping;
   elements.restoreCurrent.hidden = !state.isSleeping;
@@ -128,20 +368,22 @@ function render(state) {
   elements.restoreAll.disabled = sleepingCount === 0;
   elements.profile.disabled = false;
   elements.resetYouTube.disabled = youtubeCount === 0;
-  elements.allowlistToggle.disabled = !state.currentHost || state.isSleeping;
-  elements.allowlistToggle.setAttribute('aria-checked', String(isCurrentHostAllowlisted(state)));
-  elements.powerStatus.textContent = state.powerStatus?.label || 'Питание: неизвестно';
+  elements.allowlistToggle.disabled = state.isSleeping;
+  setAllowlistToggleValue(isCurrentHostAllowlisted(state));
+  renderPowerStatus(state.powerStatus);
 }
 
 async function refresh() {
   try {
-    const state = await send('tab-sleeper:get-popup-state');
+    const backgroundState = await send('tab-sleeper:get-popup-state', await readActiveTabHint());
+    const state = await enrichPopupState(backgroundState);
     render(state);
-    try {
-      renderMemoryStatus(await readMemoryStatus(state.settings));
-    } catch {
-      renderMemoryStatus(null);
-    }
+    const [memoryResult, powerResult] = await Promise.allSettled([
+      readMemoryStatus(state.settings),
+      readPowerStatus(state.settings),
+    ]);
+    renderMemoryStatus(memoryResult.status === 'fulfilled' ? memoryResult.value : null);
+    renderPowerStatus(powerResult.status === 'fulfilled' ? powerResult.value : null);
   } catch (error) {
     elements.statusTitle.textContent = 'Не удалось прочитать вкладку';
     elements.tabTitle.textContent = 'Safari отклонил запрос расширения.';
@@ -150,7 +392,7 @@ async function refresh() {
 }
 
 async function runAction(button, action) {
-  const canChangeLabel = button.tagName !== 'SELECT' && !button.classList.contains('switch-button');
+  const canChangeLabel = button.tagName === 'BUTTON';
   const original = button.textContent;
   let refreshed = false;
   button.disabled = true;
@@ -159,11 +401,13 @@ async function runAction(button, action) {
   }
   try {
     const result = await action();
-    if (result?.ok === false) {
-      elements.tabMeta.textContent = `Пропущено: ${result.reason}`;
-    }
     await refresh();
     refreshed = true;
+    if (result?.ok === false) {
+      elements.tabMeta.textContent = `Действие не выполнено: ${formatActionReason(result.reason)}`;
+    }
+  } catch (error) {
+    elements.tabMeta.textContent = `Ошибка: ${String(error?.message ?? error)}`;
   } finally {
     if (!refreshed) {
       button.disabled = false;
@@ -174,14 +418,26 @@ async function runAction(button, action) {
   }
 }
 
+function formatActionReason(reason) {
+  const labels = {
+    allowlisted: 'для этого сайта включена защита от усыпления',
+    'already-sleeping': 'вкладка уже спит',
+    'dirty-form': 'на странице есть несохранённые данные',
+    'missing-active-tab': 'Safari не передал активную вкладку',
+    'sleep-server-unavailable': 'локальный companion недоступен',
+    'unsupported-url': 'эту страницу нельзя усыпить',
+  };
+  return labels[reason] || String(reason || 'неизвестная причина');
+}
+
 elements.sleepCurrent.addEventListener('click', () => {
-  runAction(elements.sleepCurrent, () => send('tab-sleeper:sleep-current'));
+  runAction(elements.sleepCurrent, sleepCurrentWithFallback);
 });
 
 elements.restoreCurrent.addEventListener('click', () => {
   const token = currentState?.sleepEntry?.token;
   const tabId = currentState?.tab?.id;
-  if (!token || !tabId) {
+  if (!token || tabId == null) {
     return;
   }
   runAction(elements.restoreCurrent, () => send('tab-sleeper:restore', { token, tabId }));
@@ -204,11 +460,13 @@ elements.freeMemoryNow.addEventListener('click', () => {
 });
 
 elements.allowlistToggle.addEventListener('click', () => {
-  runAction(elements.allowlistToggle, () => send('tab-sleeper:toggle-allowlist-current'));
+  const enabled = !getAllowlistToggleValue();
+  setAllowlistToggleValue(enabled);
+  void updateAllowlistToggle(enabled);
 });
 
 elements.resetYouTube.addEventListener('click', () => {
-  runAction(elements.resetYouTube, () => send('tab-sleeper:reset-youtube-counter'));
+  runAction(elements.resetYouTube, async () => send('tab-sleeper:reset-youtube-counter', await readActiveTabHint()));
 });
 
 elements.profile.addEventListener('change', () => {

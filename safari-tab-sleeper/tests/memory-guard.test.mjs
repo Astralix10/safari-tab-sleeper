@@ -159,3 +159,28 @@ test('memory guard self-heals the localhost sleep server', async () => {
   assert.equal(installer.includes('launchctl bootstrap "gui/$(id -u)" "$SERVER_PLIST"'), false);
   assert.equal(installer.includes('rm -f "$SERVER_PLIST"'), true);
 });
+
+test('memory guard rejects malformed numeric arguments before measuring processes', async () => {
+  for (const args of [
+    ['--threshold-gb', 'abc'],
+    ['--threshold-gb', '-1'],
+    ['--interval', '1.5'],
+    ['--cooldown', '-5'],
+    ['--cleanup-cooldown', 'nope'],
+  ]) {
+    await assert.rejects(
+      execFileAsync('zsh', ['companion/memory-guard.zsh', ...args, '--once', '--dry-run'], {
+        cwd: new URL('..', import.meta.url),
+      }),
+      (error) => error.code === 2 && /Ошибка аргумента/.test(error.stderr),
+    );
+  }
+});
+
+test('memory guard rotates oversized companion server logs before restart', async () => {
+  const script = await readFile(new URL('../companion/memory-guard.zsh', import.meta.url), 'utf8');
+
+  assert.equal(script.includes('rotate_log_if_needed()'), true);
+  assert.equal(script.includes('2097152'), true);
+  assert.equal(script.includes('rotate_log_if_needed "$SLEEP_SERVER_ERROR_LOG"'), true);
+});

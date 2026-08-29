@@ -35,15 +35,13 @@
     <section class="actions" aria-label="Действия со вкладками">
       <button id="sleep-current" class="primary" type="button">Усыпить текущую вкладку</button>
       <button id="restore-current" type="button" hidden>Восстановить вкладку</button>
-      <button id="sleep-all-except-current" type="button">Усыпить все, кроме текущей</button>
+      <button id="sleep-all-except-current" type="button">Усыпить все фоновые вкладки</button>
       <button id="restore-all" type="button">Разбудить все вкладки</button>
       <button id="sleep-youtube" type="button">Усыпить тяжёлые фоновые вкладки</button>
       <button id="free-memory-now" class="primary" type="button">Освободить память сейчас</button>
       <div class="allowlist-row">
-        <button id="allowlist-toggle" class="switch-button" type="button" role="switch" aria-checked="false">
-          <span class="switch-track" aria-hidden="true">
-            <span class="switch-thumb"></span>
-          </span>
+        <button id="allowlist-toggle" class="switch-button" type="button" data-enabled="false">
+          <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
           <span class="switch-label">Не усыплять сайт</span>
         </button>
       </div>

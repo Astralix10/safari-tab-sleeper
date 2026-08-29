@@ -28,6 +28,8 @@
     try {
       api.runtime.sendMessage({
         type: 'tab-sleeper:page-state',
+        pageUrl: location.href,
+        pageTitle: document.title,
         dirty,
         youtubeVideoCount,
         youtubeLastVideoUrl,
@@ -85,10 +87,19 @@
   }
 
   api.runtime.onMessage.addListener((message) => {
+    if (message?.type === 'tab-sleeper:get-page-info') {
+      return Promise.resolve({
+        pageUrl: location.href,
+        pageTitle: document.title,
+      });
+    }
+
     if (message?.type === 'tab-sleeper:can-sleep') {
       return Promise.resolve({
         canSleep: !dirty,
         dirty,
+        pageUrl: location.href,
+        pageTitle: document.title,
         youtubeVideoCount,
         youtubeLastVideoUrl,
       });

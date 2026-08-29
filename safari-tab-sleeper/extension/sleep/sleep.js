@@ -89,7 +89,7 @@ async function restoreNow() {
   let result = null;
   try {
     const [tab] = await api.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) {
+    if (tab?.id == null) {
       throw new Error('missing-active-tab');
     }
     result = await send('tab-sleeper:restore', { token, tabId: tab.id });

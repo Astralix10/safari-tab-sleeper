@@ -48,7 +48,7 @@ end hostFromURL
 on loadAllowlist(allowlistPath)
 	if allowlistPath is "" then return {}
 	try
-		set rawText to read POSIX file allowlistPath as «class utf8»
+		set rawText to read (POSIX file allowlistPath) as text
 		return paragraphs of rawText
 	on error
 		return {}

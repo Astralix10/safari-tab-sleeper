@@ -15,6 +15,13 @@ function show(enabled, useSettingsInsteadOfPreferences) {
     }
 }
 
+function showError(message) {
+    const detail = String(message || "Неизвестная ошибка.");
+    document.getElementsByClassName('state-unknown')[0].innerText = `Не удалось проверить расширение: ${detail}`;
+    document.body.classList.remove('state-on');
+    document.body.classList.remove('state-off');
+}
+
 function openPreferences() {
     webkit.messageHandlers.controller.postMessage("open-preferences");
 }

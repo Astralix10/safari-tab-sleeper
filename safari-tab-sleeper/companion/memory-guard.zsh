@@ -1,5 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
+setopt extendedglob
 
 SCRIPT_DIR="${0:A:h}"
 THRESHOLD_GB="3"
@@ -20,6 +21,7 @@ SLEEP_SERVER_SCRIPT="$SCRIPT_DIR/sleeper-server.py"
 SLEEP_SERVER_LOG="$HOME/Library/Logs/safari-tab-sleeper-server.log"
 SLEEP_SERVER_ERROR_LOG="$HOME/Library/Logs/safari-tab-sleeper-server.err.log"
 PYTHON_BIN="${SAFARI_TAB_SLEEPER_PYTHON:-/usr/bin/python3}"
+MUTATION_TOKEN_FILE="${SAFARI_TAB_SLEEPER_TOKEN_FILE:-$SCRIPT_DIR/companion-token}"
 
 usage() {
   cat <<'EOF'
@@ -43,33 +45,52 @@ Options:
 EOF
 }
 
+fail_argument() {
+  print -- "Ошибка аргумента: $1" >&2
+  usage >&2
+  exit 2
+}
+
+require_option_value() {
+  local option_name="$1"
+  local option_value="${2-}"
+  [[ -n "$option_value" ]] || fail_argument "$option_name требует значение"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --threshold-gb)
+      require_option_value "$1" "${2-}"
       THRESHOLD_GB="$2"
       shift 2
       ;;
     --alert-threshold-gb)
+      require_option_value "$1" "${2-}"
       ALERT_THRESHOLD_GB="$2"
       shift 2
       ;;
     --interval)
+      require_option_value "$1" "${2-}"
       INTERVAL_SECONDS="$2"
       shift 2
       ;;
     --cooldown)
+      require_option_value "$1" "${2-}"
       COOLDOWN_SECONDS="$2"
       shift 2
       ;;
     --cleanup-cooldown)
+      require_option_value "$1" "${2-}"
       CLEANUP_COOLDOWN_SECONDS="$2"
       shift 2
       ;;
     --sample)
+      require_option_value "$1" "${2-}"
       SAMPLE_FILE="$2"
       shift 2
       ;;
     --swap-sample)
+      require_option_value "$1" "${2-}"
       SWAP_SAMPLE_FILE="$2"
       shift 2
       ;;
@@ -96,6 +117,29 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+is_positive_number() {
+  local value="$1"
+  [[ "$value" == <-> || "$value" == <->.<-> ]] || return 1
+  awk -v value="$value" 'BEGIN { exit !(value > 0) }'
+}
+
+is_positive_integer() {
+  local value="$1"
+  [[ "$value" == <-> ]] || return 1
+  (( 10#$value > 0 ))
+}
+
+is_nonnegative_integer() {
+  local value="$1"
+  [[ "$value" == <-> ]]
+}
+
+is_positive_number "$THRESHOLD_GB" || fail_argument "--threshold-gb должен быть числом больше нуля"
+is_positive_number "$ALERT_THRESHOLD_GB" || fail_argument "--alert-threshold-gb должен быть числом больше нуля"
+is_positive_integer "$INTERVAL_SECONDS" || fail_argument "--interval должен быть целым числом больше нуля"
+is_nonnegative_integer "$COOLDOWN_SECONDS" || fail_argument "--cooldown должен быть целым неотрицательным числом"
+is_nonnegative_integer "$CLEANUP_COOLDOWN_SECONDS" || fail_argument "--cleanup-cooldown должен быть целым неотрицательным числом"
 
 collect_processes() {
   if [[ -n "$SAMPLE_FILE" ]]; then
@@ -197,6 +241,18 @@ sleep_server_is_healthy() {
   /usr/bin/curl --silent --fail --max-time 1 "$SLEEP_SERVER_HEALTH_URL" >/dev/null 2>&1
 }
 
+rotate_log_if_needed() {
+  local log_file="$1"
+  local max_bytes="${2:-2097152}"
+  local size
+  [[ -f "$log_file" ]] || return 0
+  size="$(wc -c < "$log_file" | tr -d ' ')"
+  if [[ "$size" == <-> && "$size" -gt "$max_bytes" ]]; then
+    tail -c "$max_bytes" "$log_file" > "$log_file.1"
+    : > "$log_file"
+  fi
+}
+
 ensure_sleep_server() {
   if sleep_server_is_healthy; then
     return 0
@@ -207,7 +263,17 @@ ensure_sleep_server() {
     return 1
   fi
 
-  "$PYTHON_BIN" "$SLEEP_SERVER_SCRIPT" </dev/null >>"$SLEEP_SERVER_LOG" 2>>"$SLEEP_SERVER_ERROR_LOG" &!
+  local mutation_token
+  mutation_token="$(cat "$MUTATION_TOKEN_FILE" 2>/dev/null || true)"
+  if [[ "$mutation_token" != [0-9a-f]## || ${#mutation_token} -ne 64 ]]; then
+    print "Safari Tab Sleeper: отсутствует корректный companion token" >&2
+    return 1
+  fi
+
+  rotate_log_if_needed "$SLEEP_SERVER_LOG"
+  rotate_log_if_needed "$SLEEP_SERVER_ERROR_LOG"
+  SAFARI_TAB_SLEEPER_MUTATION_TOKEN="$mutation_token" \
+    "$PYTHON_BIN" "$SLEEP_SERVER_SCRIPT" </dev/null >>"$SLEEP_SERVER_LOG" 2>>"$SLEEP_SERVER_ERROR_LOG" &!
 
   local attempt
   for attempt in {1..20}; do

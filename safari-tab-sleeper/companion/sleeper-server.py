@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import base64
+import hmac
 import json
 import os
 import re
+import secrets
 import subprocess
-import sys
 import threading
+import time
 from urllib.parse import parse_qs, urlparse
 
 HOST = "127.0.0.1"
@@ -25,6 +27,14 @@ SETTINGS_READY_PATH = os.environ.get(
     "SAFARI_TAB_SLEEPER_SETTINGS_READY_PATH",
     os.path.join(os.path.dirname(ALLOWLIST_PATH) or os.path.dirname(__file__), "settings-ready"),
 )
+TRUSTED_ORIGIN_PATH = os.environ.get(
+    "SAFARI_TAB_SLEEPER_TRUSTED_ORIGIN_PATH",
+    os.path.join(os.path.dirname(ALLOWLIST_PATH) or os.path.dirname(__file__), "trusted-extension-origin.txt"),
+)
+HEARTBEAT_PATH = os.environ.get(
+    "SAFARI_TAB_SLEEPER_HEARTBEAT_PATH",
+    os.path.join(os.path.dirname(ALLOWLIST_PATH) or os.path.dirname(__file__), "extension-heartbeat.txt"),
+)
 ARCHIVE_LIMIT = int(os.environ.get("SAFARI_TAB_SLEEPER_ARCHIVE_LIMIT", "300"))
 YOUTUBE_FAMILY_DOMAINS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
 YOUTUBE_ALLOWLIST_PATTERNS = (
@@ -35,14 +45,27 @@ YOUTUBE_ALLOWLIST_PATTERNS = (
     "youtube-nocookie.com",
     "*.youtube-nocookie.com",
 )
-TRUSTED_EXTENSION_ORIGIN_PREFIXES = (
+TRUSTED_EXTENSION_SCHEMES = (
     "safari-web-extension://",
     "safari-extension://",
     "chrome-extension://",
     "moz-extension://",
 )
+MUTATION_HEADER = "X-Safari-Tab-Sleeper-Token"
+MUTATION_TOKEN = os.environ.get(
+    "SAFARI_TAB_SLEEPER_MUTATION_TOKEN",
+    "",
+)
+SLEEP_CURRENT_SCRIPT = os.environ.get(
+    "SAFARI_TAB_SLEEPER_CURRENT_SCRIPT",
+    os.path.join(os.path.dirname(__file__), "sleep-current-tab.applescript"),
+)
 ARCHIVE_LOCK = threading.RLock()
 SETTINGS_LOCK = threading.RLock()
+TRUSTED_ORIGIN_LOCK = threading.RLock()
+HEARTBEAT_LOCK = threading.RLock()
+LAST_EXTENSION_HEARTBEAT = 0.0
+EXTENSION_HEARTBEAT_MAX_AGE_SECONDS = 15 * 60
 
 SLEEP_HTML = r"""<!doctype html>
 <html lang="ru">
@@ -387,6 +410,88 @@ def collect_power_status():
     }
 
 
+def collect_active_safari_tab():
+    script = r'''
+tell application "Safari"
+    if it is not running then return ""
+    if (count of windows) is 0 then return ""
+    set targetTab to current tab of front window
+    set tabURL to URL of targetTab
+    try
+        set tabTitle to name of targetTab
+    on error
+        set tabTitle to tabURL
+    end try
+    return tabURL & linefeed & tabTitle
+end tell
+'''
+    output = run_command(["/usr/bin/osascript", "-e", script]).rstrip("\n")
+    if not output:
+        return {"ok": False, "reason": "missing-active-tab", "url": "", "title": ""}
+
+    url, _, title = output.partition("\n")
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return {"ok": False, "reason": "unsupported-active-tab", "url": "", "title": ""}
+
+    return {
+        "ok": True,
+        "url": parsed.geturl(),
+        "title": title.strip() or parsed.geturl(),
+    }
+
+
+def sleep_current_safari_tab():
+    if not os.path.isfile(SLEEP_CURRENT_SCRIPT):
+        return {"ok": False, "reason": "sleep-script-missing"}
+
+    active_tab = collect_active_safari_tab()
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/osascript",
+                SLEEP_CURRENT_SCRIPT,
+                f"http://{HOST}:{PORT}/sleep",
+                ALLOWLIST_PATH,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "reason": "automation-timeout"}
+    except Exception:
+        return {"ok": False, "reason": "automation-unavailable"}
+
+    output = str(result.stdout or "").strip()
+    reason_match = re.search(r"(?:^|\s)reason=([^\s]+)", output)
+    count_match = re.search(r"(?:^|\s)slept_count=(\d+)", output)
+    slept_count = int(count_match.group(1)) if count_match else 0
+    if result.returncode == 0 and slept_count > 0:
+        response = {"ok": True, "sleptCount": slept_count}
+        if active_tab.get("ok"):
+            entry, _ = archive_entry({
+                "token": secrets.token_urlsafe(18),
+                "url": active_tab.get("url"),
+                "title": active_tab.get("title"),
+                "sleptAt": int(time.time() * 1000),
+                "reason": "manual-current-tab",
+                "autoRestore": False,
+            })
+            if entry:
+                response["token"] = entry["token"]
+        return response
+
+    if reason_match:
+        return {"ok": False, "reason": reason_match.group(1), "sleptCount": slept_count}
+    return {
+        "ok": False,
+        "reason": "automation-failed" if result.returncode else "missing-active-tab",
+        "sleptCount": slept_count,
+    }
+
+
 def sanitize_domain_patterns(value):
     raw_entries = value if isinstance(value, list) else []
     patterns = []
@@ -445,6 +550,81 @@ def write_settings_ready():
 
 def settings_ready():
     return os.path.exists(SETTINGS_READY_PATH)
+
+
+def normalize_extension_origin(value):
+    candidate = str(value or "").strip()
+    if not candidate.startswith(TRUSTED_EXTENSION_SCHEMES):
+        return ""
+    parsed = urlparse(candidate)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def read_trusted_extension_origin():
+    with TRUSTED_ORIGIN_LOCK:
+        try:
+            with open(TRUSTED_ORIGIN_PATH, "r", encoding="utf-8") as file:
+                return normalize_extension_origin(file.read())
+        except Exception:
+            return ""
+
+
+def pair_extension_origin(origin):
+    candidate = normalize_extension_origin(origin)
+    if not candidate:
+        return False
+
+    with TRUSTED_ORIGIN_LOCK:
+        trusted_origin = read_trusted_extension_origin()
+        if trusted_origin:
+            return hmac.compare_digest(candidate, trusted_origin)
+
+        origin_dir = os.path.dirname(TRUSTED_ORIGIN_PATH)
+        if origin_dir:
+            os.makedirs(origin_dir, exist_ok=True)
+        temp_path = f"{TRUSTED_ORIGIN_PATH}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as file:
+            file.write(f"{candidate}\n")
+        os.replace(temp_path, TRUSTED_ORIGIN_PATH)
+        return True
+
+
+def mark_extension_heartbeat():
+    global LAST_EXTENSION_HEARTBEAT
+    timestamp = time.time()
+    with HEARTBEAT_LOCK:
+        LAST_EXTENSION_HEARTBEAT = timestamp
+        try:
+            heartbeat_dir = os.path.dirname(HEARTBEAT_PATH)
+            if heartbeat_dir:
+                os.makedirs(heartbeat_dir, exist_ok=True)
+            temp_path = f"{HEARTBEAT_PATH}.tmp"
+            with open(temp_path, "w", encoding="utf-8") as file:
+                file.write(f"{timestamp:.6f}\n")
+            os.replace(temp_path, HEARTBEAT_PATH)
+        except OSError:
+            pass
+    return {"ok": True, "active": True}
+
+
+def collect_extension_state():
+    global LAST_EXTENSION_HEARTBEAT
+    with HEARTBEAT_LOCK:
+        if not LAST_EXTENSION_HEARTBEAT:
+            try:
+                with open(HEARTBEAT_PATH, "r", encoding="utf-8") as file:
+                    LAST_EXTENSION_HEARTBEAT = float(file.read().strip())
+            except (OSError, ValueError):
+                LAST_EXTENSION_HEARTBEAT = 0.0
+        age_seconds = max(0.0, time.time() - LAST_EXTENSION_HEARTBEAT) if LAST_EXTENSION_HEARTBEAT else None
+    active = age_seconds is not None and age_seconds <= EXTENSION_HEARTBEAT_MAX_AGE_SECONDS
+    return {
+        "ok": True,
+        "active": active,
+        "ageSeconds": round(age_seconds, 1) if age_seconds is not None else None,
+    }
 
 
 def read_allowlist():
@@ -611,17 +791,35 @@ class Handler(BaseHTTPRequestHandler):
     def request_origin(self):
         return str(self.headers.get("Origin") or "").strip()
 
-    def is_trusted_origin(self, origin=None):
+    def is_extension_origin(self, origin=None):
         candidate = self.request_origin() if origin is None else str(origin or "").strip()
-        if not candidate:
-            return True
-        return candidate.startswith(TRUSTED_EXTENSION_ORIGIN_PREFIXES)
+        return bool(normalize_extension_origin(candidate))
+
+    def is_authorized_mutation(self):
+        supplied_token = str(self.headers.get(MUTATION_HEADER) or "")
+        if not MUTATION_TOKEN or not hmac.compare_digest(supplied_token, MUTATION_TOKEN):
+            return False
+        origin = self.request_origin()
+        return not origin or pair_extension_origin(origin)
 
     def send_cors_headers(self):
         origin = self.request_origin()
-        if origin and self.is_trusted_origin(origin):
+        if self.is_extension_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
+
+    def read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as error:
+            raise ValueError("invalid-content-length") from error
+        if length < 0 or length > 256 * 1024:
+            raise ValueError("request-too-large")
+        raw_body = self.rfile.read(length)
+        body = json.loads(raw_body.decode("utf-8") or "{}")
+        if not isinstance(body, dict):
+            raise ValueError("invalid-json-object")
+        return body
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -633,6 +831,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/power":
             self.send_json(200, collect_power_status())
+            return
+        if path == "/active-tab":
+            self.send_json(200, collect_active_safari_tab())
+            return
+        if path == "/extension-state":
+            self.send_json(200, collect_extension_state())
             return
         if path == "/settings":
             self.send_json(200, {"ok": True, "ready": settings_ready(), "allowlist": read_allowlist()})
@@ -657,19 +861,36 @@ class Handler(BaseHTTPRequestHandler):
         self.send_text(404, "not found\n", "text/plain; charset=utf-8")
 
     def do_POST(self):
-        if not self.is_trusted_origin():
-            self.send_json(403, {"ok": False, "reason": "untrusted-origin"})
+        if not self.is_authorized_mutation():
+            self.send_json(403, {"ok": False, "reason": "unauthorized-mutation"})
             return
 
         path = urlparse(self.path).path
+        try:
+            body = self.read_json_body()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_json(400, {"ok": False, "reason": "invalid-json"})
+            return
+        except ValueError as error:
+            reason = str(error) or "invalid-request"
+            status = 413 if reason == "request-too-large" else 400
+            self.send_json(status, {"ok": False, "reason": reason})
+            return
+
         if path == "/settings":
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                raw_body = self.rfile.read(max(0, min(length, 256 * 1024)))
-                body = json.loads(raw_body.decode("utf-8") or "{}")
                 self.send_json(200, save_companion_settings(body))
-            except Exception as error:
-                self.send_json(500, {"ok": False, "reason": str(error)})
+            except Exception:
+                self.send_json(500, {"ok": False, "reason": "settings-write-failed"})
+            return
+
+        if path == "/sleep-current":
+            result = sleep_current_safari_tab()
+            self.send_json(200 if result.get("ok") else 409, result)
+            return
+
+        if path == "/heartbeat":
+            self.send_json(200, mark_extension_heartbeat())
             return
 
         if path != "/archive-entry":
@@ -677,50 +898,55 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            raw_body = self.rfile.read(max(0, min(length, 256 * 1024)))
-            body = json.loads(raw_body.decode("utf-8") or "{}")
             entry, entries = archive_entry(body.get("entry"))
             if not entry:
                 self.send_json(400, {"ok": False, "reason": "invalid-archive-entry", "count": len(entries)})
                 return
             self.send_json(200, {"ok": True, "entry": entry, "count": len(entries)})
-        except Exception as error:
-            self.send_json(500, {"ok": False, "reason": str(error)})
+        except Exception:
+            self.send_json(500, {"ok": False, "reason": "archive-write-failed"})
 
     def do_OPTIONS(self):
-        if not self.is_trusted_origin():
+        if not self.is_extension_origin():
             self.send_response(403)
             self.end_headers()
             return
         self.send_response(204)
         self.send_cors_headers()
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "content-type")
+        self.send_header("Access-Control-Allow-Headers", f"content-type, {MUTATION_HEADER.lower()}")
         self.end_headers()
 
     def send_text(self, status, body, content_type):
         encoded = body.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(encoded)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_cors_headers()
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+        return True
 
     def send_json(self, status, body):
         encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_cors_headers()
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+        return True
 
     def log_message(self, format, *args):
-        sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
+        return
 
 
 if __name__ == "__main__":

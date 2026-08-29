@@ -71,9 +71,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func sleepActiveSafariTab() {
         runInBackground({ [self] in
-            run("/usr/bin/osascript", [scriptPath("sleep-current-tab.applescript"), sleepServerURL])
+            run("/usr/bin/osascript", [
+                scriptPath("sleep-current-tab.applescript"),
+                sleepServerURL,
+                scriptPath("allowlist.txt")
+            ])
         }, completion: { [self] output in
-            notify("Активная вкладка усыплена", output.isEmpty ? "Активная вкладка Safari отправлена спать." : output)
+            if output.contains("reason=allowlisted") {
+                notify("Вкладка защищена", "Этот сайт отмечен как «Не усыплять».")
+            } else {
+                notify("Активная вкладка усыплена", output.isEmpty ? "Активная вкладка Safari отправлена спать." : output)
+            }
         })
     }
 

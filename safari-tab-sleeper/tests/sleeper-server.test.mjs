@@ -1,9 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+const MUTATION_TOKEN = 'test-token-do-not-use';
+process.env.SAFARI_TAB_SLEEPER_MUTATION_TOKEN = MUTATION_TOKEN;
+const mutationHeaders = (extra = {}) => ({
+  'content-type': 'application/json',
+  'x-safari-tab-sleeper-token': MUTATION_TOKEN,
+  ...extra,
+});
 
 async function waitForHealth(port) {
   const url = `http://127.0.0.1:${port}/health`;
@@ -48,6 +56,43 @@ test('sleep server exposes current Safari memory status as JSON', async () => {
     assert.equal(Number.isFinite(body.swapUsedMb), true);
     assert.equal(typeof body.label, 'string');
     assert.match(body.label, /Safari\/WebKit/);
+  } finally {
+    server.kill();
+  }
+});
+
+test('sleep server reports a recent authenticated extension heartbeat', async () => {
+  const port = 22200 + Math.floor(Math.random() * 200);
+  const dir = await mkdtemp(join(tmpdir(), 'safari-tab-sleeper-heartbeat-'));
+  const heartbeatPath = join(dir, 'extension-heartbeat.txt');
+  const server = spawn('python3', ['companion/sleeper-server.py'], {
+    cwd: new URL('..', import.meta.url),
+    env: {
+      ...process.env,
+      SAFARI_TAB_SLEEPER_PORT: String(port),
+      SAFARI_TAB_SLEEPER_HEARTBEAT_PATH: heartbeatPath,
+    },
+    stdio: 'ignore',
+  });
+
+  try {
+    await waitForHealth(port);
+    const initial = await fetch(`http://127.0.0.1:${port}/extension-state`).then((response) => response.json());
+    assert.equal(initial.ok, true);
+    assert.equal(initial.active, false);
+
+    const heartbeat = await fetch(`http://127.0.0.1:${port}/heartbeat`, {
+      method: 'POST',
+      headers: mutationHeaders(),
+      body: '{}',
+    });
+    assert.equal(heartbeat.ok, true);
+
+    const current = await fetch(`http://127.0.0.1:${port}/extension-state`).then((response) => response.json());
+    assert.equal(current.ok, true);
+    assert.equal(current.active, true);
+    assert.equal(typeof current.ageSeconds, 'number');
+    assert.equal(Number.isFinite(Number((await readFile(heartbeatPath, 'utf8')).trim())), true);
   } finally {
     server.kill();
   }
@@ -106,7 +151,7 @@ test('sleep server archives sleep entries and removes duplicate URLs', async () 
     for (const entry of [first, second]) {
       const response = await fetch(`http://127.0.0.1:${port}/archive-entry`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: mutationHeaders(),
         body: JSON.stringify({ entry }),
       });
       assert.equal(response.ok, true);
@@ -147,7 +192,7 @@ test('sleep server unwraps nested sleep URLs before archiving', async () => {
     await waitForHealth(port);
     const stored = await fetch(`http://127.0.0.1:${port}/archive-entry`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: mutationHeaders(),
       body: JSON.stringify({
         entry: { token: 'nested-token', url: nestedUrl, title: 'Nested', sleptAt: 1 },
       }),
@@ -187,7 +232,7 @@ test('sleep server keeps every unique entry during concurrent archive writes', a
     }));
     const responses = await Promise.all(entries.map((entry) => fetch(`http://127.0.0.1:${port}/archive-entry`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: mutationHeaders(),
       body: JSON.stringify({ entry }),
     })));
 
@@ -247,7 +292,7 @@ test('sleep server syncs extension allowlist for companion AppleScript cleanup',
     await waitForHealth(port);
     const response = await fetch(`http://127.0.0.1:${port}/settings`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: mutationHeaders(),
       body: JSON.stringify({
         allowlist: ['www.youtube.com', '*.example.com', '#ignored'],
       }),
@@ -296,6 +341,7 @@ test('sleep server rejects settings writes from ordinary web pages', async () =>
       SAFARI_TAB_SLEEPER_PORT: String(port),
       SAFARI_TAB_SLEEPER_ALLOWLIST_PATH: join(dir, 'allowlist.txt'),
       SAFARI_TAB_SLEEPER_SETTINGS_READY_PATH: join(dir, 'settings-ready'),
+      SAFARI_TAB_SLEEPER_TRUSTED_ORIGIN_PATH: join(dir, 'trusted-origin.txt'),
     },
     stdio: 'ignore',
   });
@@ -310,13 +356,82 @@ test('sleep server rejects settings writes from ordinary web pages', async () =>
     assert.equal(rejected.status, 403);
 
     const trustedOrigin = 'safari-web-extension://unit-test';
-    const accepted = await fetch(`http://127.0.0.1:${port}/settings`, {
+    const missingToken = await fetch(`http://127.0.0.1:${port}/settings`, {
       method: 'POST',
       headers: { origin: trustedOrigin, 'content-type': 'application/json' },
+      body: JSON.stringify({ allowlist: ['evil.example'] }),
+    });
+    assert.equal(missingToken.status, 403);
+
+    const accepted = await fetch(`http://127.0.0.1:${port}/settings`, {
+      method: 'POST',
+      headers: mutationHeaders({ origin: trustedOrigin }),
       body: JSON.stringify({ allowlist: ['example.com'] }),
     });
     assert.equal(accepted.ok, true);
     assert.equal(accepted.headers.get('access-control-allow-origin'), trustedOrigin);
+
+    const unrelated = await fetch(`http://127.0.0.1:${port}/settings`, {
+      method: 'POST',
+      headers: mutationHeaders({ origin: 'safari-web-extension://unrelated-extension' }),
+      body: JSON.stringify({ allowlist: ['evil.example'] }),
+    });
+    assert.equal(unrelated.status, 403);
+  } finally {
+    server.kill();
+  }
+});
+
+test('sleep server reports malformed mutation JSON as a client error', async () => {
+  const port = 26500 + Math.floor(Math.random() * 300);
+  const server = spawn('python3', ['companion/sleeper-server.py'], {
+    cwd: new URL('..', import.meta.url),
+    env: { ...process.env, SAFARI_TAB_SLEEPER_PORT: String(port) },
+    stdio: 'ignore',
+  });
+
+  try {
+    await waitForHealth(port);
+    const response = await fetch(`http://127.0.0.1:${port}/settings`, {
+      method: 'POST',
+      headers: mutationHeaders(),
+      body: '{broken',
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { ok: false, reason: 'invalid-json' });
+  } finally {
+    server.kill();
+  }
+});
+
+test('sleep-current endpoint returns the companion automation result', async () => {
+  const port = 26900 + Math.floor(Math.random() * 90);
+  const dir = await mkdtemp(join(tmpdir(), 'safari-tab-sleeper-current-'));
+  const scriptPath = join(dir, 'sleep-current.applescript');
+  await writeFile(scriptPath, 'on run argv\nreturn "slept_count=1"\nend run\n');
+  const server = spawn('python3', ['companion/sleeper-server.py'], {
+    cwd: new URL('..', import.meta.url),
+    env: {
+      ...process.env,
+      SAFARI_TAB_SLEEPER_PORT: String(port),
+      SAFARI_TAB_SLEEPER_CURRENT_SCRIPT: scriptPath,
+      SAFARI_TAB_SLEEPER_ALLOWLIST_PATH: join(dir, 'allowlist.txt'),
+      SAFARI_TAB_SLEEPER_ARCHIVE_PATH: join(dir, 'archive.json'),
+    },
+    stdio: 'ignore',
+  });
+
+  try {
+    await waitForHealth(port);
+    const response = await fetch(`http://127.0.0.1:${port}/sleep-current`, {
+      method: 'POST',
+      headers: mutationHeaders(),
+      body: '{}',
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.sleptCount, 1);
   } finally {
     server.kill();
   }

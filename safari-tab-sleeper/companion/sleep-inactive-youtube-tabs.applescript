@@ -48,7 +48,7 @@ end hostFromURL
 on loadAllowlist(allowlistPath)
 	if allowlistPath is "" then return {}
 	try
-		set rawText to read POSIX file allowlistPath as «class utf8»
+		set rawText to read (POSIX file allowlistPath) as text
 		return paragraphs of rawText
 	on error
 		return {}
@@ -91,10 +91,13 @@ on isLocalSleeperURL(tabURL)
 end isLocalSleeperURL
 
 on isPressureURL(tabURL)
-	set lowerURL to my lowerText(tabURL)
+	set hostText to my hostFromURL(tabURL)
+	if hostText is "" then return false
 	set pressureDomains to {"youtube.com", "youtu.be", "twitch.tv", "netflix.com", "meet.google.com", "figma.com", "canva.com", "reddit.com", "x.com", "twitter.com"}
 	repeat with pressureDomain in pressureDomains
-		if lowerURL contains (pressureDomain as text) then return true
+		set domainText to pressureDomain as text
+		if hostText is domainText then return true
+		if hostText ends with ("." & domainText) then return true
 	end repeat
 	return false
 end isPressureURL

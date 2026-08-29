@@ -11,24 +11,31 @@ import {
   extractSleepToken,
   formatReason,
   hostnameFromUrl,
+  isAllowlisted,
+  isKnownSleepPageUrl,
   isPressureDomain,
   isYouTubeUrl,
   makeSleepToken,
   makeRuntimeMessageListener,
   mergeYouTubePageState,
   mergeSettings,
+  normalizeAllowlist,
   normalizeRestorableUrl,
   reconcileSleepingTabsWithOpenTabs,
   shouldHealStuckSleepTab,
   shouldTreatYouTubeAsHighRisk,
+  setAllowlistForHost,
   toggleAllowlistForHost,
 } from './core.js';
+import { companionMutationHeaders } from '../shared/companion-auth.js';
 
 const api = globalThis.browser ?? globalThis.chrome;
 const RUNTIME_BASE_URL = api.runtime.getURL('/');
 const SCAN_ALARM = 'tab-sleeper-scan';
+const SETTINGS_SCHEMA_VERSION = 2;
 const STORAGE_KEYS = {
   settings: 'settings',
+  settingsSchemaVersion: 'settingsSchemaVersion',
   tabStates: 'tabStates',
   sleepingTabs: 'sleepingTabs',
   notificationState: 'notificationState',
@@ -48,16 +55,93 @@ const pendingTabSleeps = new Set();
 const storageMutationQueues = new Map();
 let sleepQueue = Promise.resolve();
 let scanInFlight = null;
+let settingsInitialization = null;
+let companionSettingsSyncQueue = Promise.resolve();
+let lastActiveTabId = null;
+let lastActiveWindowId = null;
+let activeTabDebug = { source: 'not-queried' };
+
+function rememberActiveTab(tabId, windowId = null) {
+  if (tabId == null) {
+    return;
+  }
+  lastActiveTabId = tabId;
+  if (windowId != null) {
+    lastActiveWindowId = windowId;
+  }
+}
+
+function debugActiveTab(source, tab, hint = {}) {
+  activeTabDebug = {
+    source,
+    hintTabId: hint.currentTabId ?? null,
+    rememberedTabId: lastActiveTabId,
+    tabId: tab?.id ?? null,
+    tabUrl: tab?.url || '',
+    tabTitle: tab?.title || '',
+    windowId: tab?.windowId ?? null,
+  };
+  return tab;
+}
 
 async function readSettings() {
-  const result = await api.storage.local.get(STORAGE_KEYS.settings);
-  return mergeSettings(result[STORAGE_KEYS.settings] ?? DEFAULT_SETTINGS);
+  const result = await api.storage.local.get([
+    STORAGE_KEYS.settings,
+    STORAGE_KEYS.settingsSchemaVersion,
+  ]);
+  if (
+    result[STORAGE_KEYS.settings]
+    && Number(result[STORAGE_KEYS.settingsSchemaVersion]) >= SETTINGS_SCHEMA_VERSION
+  ) {
+    const storedSettings = mergeSettings(result[STORAGE_KEYS.settings]);
+    const companion = await readLocalJson(storedSettings, '/settings');
+    if (!companion) {
+      return storedSettings;
+    }
+    if (!companion.ready || !Array.isArray(companion.allowlist)) {
+      await syncCompanionSettings(storedSettings);
+      return storedSettings;
+    }
+
+    const restoredAllowlist = normalizeAllowlist([
+      ...(storedSettings.allowlist ?? []),
+      ...companion.allowlist,
+    ]);
+    const settings = mergeSettings({ ...storedSettings, allowlist: restoredAllowlist });
+    if (JSON.stringify(settings.allowlist) !== JSON.stringify(storedSettings.allowlist)) {
+      await api.storage.local.set({ [STORAGE_KEYS.settings]: settings });
+    }
+    return settings;
+  }
+
+  if (!settingsInitialization) {
+    settingsInitialization = initializeSettingsFromCompanion(result[STORAGE_KEYS.settings]).finally(() => {
+      settingsInitialization = null;
+    });
+  }
+  return settingsInitialization;
+}
+
+async function initializeSettingsFromCompanion(storedSettings = null) {
+  const baseline = mergeSettings(storedSettings ?? DEFAULT_SETTINGS);
+  const companion = await readLocalJson(baseline, '/settings');
+  const restoredAllowlist = companion?.ready && Array.isArray(companion.allowlist)
+    ? normalizeAllowlist([...(baseline.allowlist ?? []), ...companion.allowlist])
+    : baseline.allowlist;
+  const settings = mergeSettings({ ...baseline, allowlist: restoredAllowlist });
+  await api.storage.local.set({
+    [STORAGE_KEYS.settings]: settings,
+    [STORAGE_KEYS.settingsSchemaVersion]: SETTINGS_SCHEMA_VERSION,
+  });
+  await syncCompanionSettings(settings);
+  return settings;
 }
 
 async function writeSettings(settings) {
   const mergedSettings = mergeSettings(settings);
   await api.storage.local.set({
     [STORAGE_KEYS.settings]: mergedSettings,
+    [STORAGE_KEYS.settingsSchemaVersion]: SETTINGS_SCHEMA_VERSION,
   });
   await syncCompanionSettings(mergedSettings);
 }
@@ -153,6 +237,8 @@ async function askPageCanSleep(tab, settings, state) {
       const youtubeState = mergeYouTubePageState(state, response);
       await patchTabState(tab.id, {
         dirty: Boolean(response.dirty),
+        pageUrl: response.pageUrl,
+        pageTitle: response.pageTitle,
         ...youtubeState,
       });
       return {
@@ -255,9 +341,186 @@ async function readPowerStatus(settings) {
   };
 }
 
+function resolveActiveTab(tab, state = {}, hint = {}) {
+  if (!tab) {
+    return null;
+  }
+
+  const knownUrl = normalizeRestorableUrl(hint.currentUrl)
+    || normalizeRestorableUrl(tab.url)
+    || normalizeRestorableUrl(state.pageUrl)
+    || normalizeRestorableUrl(state.url);
+  if (!knownUrl) {
+    return tab;
+  }
+
+  return {
+    ...tab,
+    url: knownUrl,
+    title: tab.title || hint.currentTitle || state.pageTitle || state.title || knownUrl,
+  };
+}
+
+function tabMatchesHintUrl(tab, hintedUrl) {
+  if (!hintedUrl) {
+    return true;
+  }
+  return normalizeRestorableUrl(tab?.url) === hintedUrl;
+}
+
+async function queryActiveTab(hint = {}) {
+  const hintedUrl = normalizeRestorableUrl(hint.currentUrl);
+  if (hintedUrl) {
+    try {
+      const tabs = await api.tabs.query({});
+      const matchingTab = tabs.find((candidate) => tabMatchesHintUrl(candidate, hintedUrl));
+      if (matchingTab) {
+        return debugActiveTab('hinted-url-match', matchingTab, hint);
+      }
+    } catch {
+      // Continue with narrower Safari queries below.
+    }
+  }
+
+  const hintedTabId = Number(hint.currentTabId);
+  if (Number.isFinite(hintedTabId) && hintedTabId >= 0) {
+    try {
+      const hintedTab = await api.tabs.get(hintedTabId);
+      if (hintedTab && tabMatchesHintUrl(hintedTab, hintedUrl)) {
+        return debugActiveTab('hinted-tab', hintedTab, hint);
+      }
+    } catch {
+      // Safari can rotate tab IDs while restoring a window; fall through to a query.
+    }
+  }
+
+  if (lastActiveTabId != null) {
+    try {
+      const rememberedTab = await api.tabs.get(lastActiveTabId);
+      if (rememberedTab && tabMatchesHintUrl(rememberedTab, hintedUrl)) {
+        return debugActiveTab('remembered-tab', rememberedTab, hint);
+      }
+    } catch {
+      lastActiveTabId = null;
+    }
+  }
+
+  try {
+    const window = await api.windows.getLastFocused({ populate: true });
+    const tab = window?.tabs?.find((candidate) => candidate.active);
+    if (tab && tabMatchesHintUrl(tab, hintedUrl)) {
+      return debugActiveTab('last-focused-window', tab, hint);
+    }
+  } catch {
+    // Safari popovers are not always associated with currentWindow.
+  }
+
+  if (api.tabs.getSelected) {
+    try {
+      const tab = await api.tabs.getSelected(lastActiveWindowId ?? undefined);
+      if (tab && tabMatchesHintUrl(tab, hintedUrl)) {
+        return debugActiveTab('get-selected', tab, hint);
+      }
+    } catch {
+      // Safari keeps this legacy Chromium API on some releases only.
+    }
+  }
+
+  for (const query of [
+    { active: true, lastFocusedWindow: true },
+    { active: true, currentWindow: true },
+    { active: true },
+  ]) {
+    try {
+      const [tab] = await api.tabs.query(query);
+      if (tab && tabMatchesHintUrl(tab, hintedUrl)) {
+        return debugActiveTab(`tabs-query:${Object.keys(query).join(',')}`, tab, hint);
+      }
+    } catch {
+      // Older Safari versions may not support every Chromium query flag.
+    }
+  }
+
+  if (hintedUrl) {
+    return debugActiveTab('synthetic-hint', {
+      id: null,
+      active: true,
+      url: hintedUrl,
+      title: hint.currentTitle || '',
+    }, hint);
+  }
+
+  debugActiveTab('not-found', null, hint);
+  return null;
+}
+
+async function readLivePageHint(tabId) {
+  if (tabId == null) {
+    return null;
+  }
+
+  try {
+    const response = await api.tabs.sendMessage(tabId, { type: 'tab-sleeper:get-page-info' });
+    if (normalizeRestorableUrl(response?.pageUrl)) {
+      return response;
+    }
+  } catch {
+    // Pages opened before the extension was enabled do not have the content script yet.
+  }
+
+  if (!api.scripting?.executeScript) {
+    return null;
+  }
+
+  try {
+    const results = await api.scripting.executeScript({
+      target: { tabId },
+      func: () => ({
+        pageUrl: location.href,
+        pageTitle: document.title,
+      }),
+    });
+    const result = results?.[0]?.result;
+    return normalizeRestorableUrl(result?.pageUrl) ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveCurrentTab(hint = {}) {
+  const rawTab = await queryActiveTab(hint);
+  if (rawTab?.id == null) {
+    return { tab: rawTab, state: {} };
+  }
+
+  let state = await getTabState(rawTab.id);
+  let tab = resolveActiveTab(rawTab, state, hint);
+  if (hostnameFromUrl(tab?.url)) {
+    return { tab, state };
+  }
+
+  const pageHint = await readLivePageHint(rawTab.id);
+  if (!pageHint) {
+    return { tab, state };
+  }
+
+  state = await patchTabState(rawTab.id, {
+    pageUrl: pageHint.pageUrl,
+    pageTitle: pageHint.pageTitle,
+    url: pageHint.pageUrl,
+    title: pageHint.pageTitle,
+  });
+  tab = resolveActiveTab(rawTab, state, {
+    ...hint,
+    currentUrl: pageHint.pageUrl,
+    currentTitle: pageHint.pageTitle,
+  });
+  return { tab, state };
+}
+
 async function readRuntimeSettings() {
   const baseSettings = await readSettings();
-  await syncCompanionSettings(baseSettings);
+  void syncExtensionHeartbeat(baseSettings);
   const powerStatus = await readPowerStatus(baseSettings);
   return {
     baseSettings,
@@ -271,22 +534,36 @@ async function archiveSleepEntry(settings, entry) {
     timeoutMs: 900,
     fetchOptions: {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: companionMutationHeaders(),
       body: JSON.stringify({ entry }),
     },
   });
 }
 
-async function syncCompanionSettings(settings) {
-  await readLocalJson(settings, '/settings', {
-    timeoutMs: 700,
+function syncCompanionSettings(settings) {
+  const snapshot = mergeSettings(settings);
+  const operation = companionSettingsSyncQueue.then(() => readLocalJson(snapshot, '/settings', {
+    timeoutMs: 1500,
     fetchOptions: {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: companionMutationHeaders(),
       body: JSON.stringify({
-        allowlist: settings.allowlist ?? [],
-        pressureDomains: settings.pressureDomains ?? [],
+        allowlist: snapshot.allowlist ?? [],
+        pressureDomains: snapshot.pressureDomains ?? [],
       }),
+    },
+  }));
+  companionSettingsSyncQueue = operation.catch(() => null);
+  return operation;
+}
+
+function syncExtensionHeartbeat(settings) {
+  return readLocalJson(settings, '/heartbeat', {
+    timeoutMs: 1200,
+    fetchOptions: {
+      method: 'POST',
+      headers: companionMutationHeaders(),
+      body: '{}',
     },
   });
 }
@@ -336,7 +613,7 @@ function extractKnownSleepToken(tabUrl, settings) {
 }
 
 function sleepTab(tab, reason, options = {}) {
-  if (!tab?.id) {
+  if (tab?.id == null) {
     return Promise.resolve({ ok: false, reason: 'missing-tab' });
   }
   if (pendingTabSleeps.has(tab.id)) {
@@ -364,6 +641,9 @@ async function rollbackSleepPreparation(tabId, token) {
 
 async function performSleepTab(tab, reason, options = {}) {
   const settings = options.settings ?? (await readRuntimeSettings()).settings;
+  if (isKnownSleepPageUrl(tab?.url, settings, RUNTIME_BASE_URL)) {
+    return { ok: false, reason: 'already-sleeping' };
+  }
   const state = await ensureTabState(tab);
   const guard = await askPageCanSleep(tab, settings, state);
 
@@ -377,6 +657,10 @@ async function performSleepTab(tab, reason, options = {}) {
 
   if (options.manual ? !decision.eligible : !decision.sleep) {
     return { ok: false, reason: decision.reason };
+  }
+
+  if (await isTabProtectedByLatestSettings(tab, settings)) {
+    return { ok: false, reason: 'allowlisted' };
   }
 
   const token = makeSleepToken();
@@ -439,6 +723,27 @@ async function performSleepTab(tab, reason, options = {}) {
     return { ok: false, reason: 'sleep-navigation-failed' };
   }
   return { ok: true, token, reason, strategy: 'sleep-page' };
+}
+
+async function isTabProtectedByLatestSettings(tab, fallbackSettings) {
+  let storedSettings = mergeSettings(fallbackSettings);
+  try {
+    const stored = await api.storage.local.get(STORAGE_KEYS.settings);
+    storedSettings = mergeSettings(stored[STORAGE_KEYS.settings] ?? storedSettings);
+  } catch {
+    // The companion snapshot below is an independent fallback.
+  }
+
+  if (isAllowlisted(tab?.url, storedSettings.allowlist)) {
+    return true;
+  }
+
+  const companion = await readLocalJson(storedSettings, '/settings', { timeoutMs: 500 });
+  return Boolean(
+    companion?.ready
+    && Array.isArray(companion.allowlist)
+    && isAllowlisted(tab?.url, companion.allowlist),
+  );
 }
 
 async function restoreSleepingTab(tabId, token) {
@@ -529,10 +834,16 @@ async function performTabScan() {
     api.tabs.query({}),
     readObject(STORAGE_KEYS.tabStates),
   ]);
+  const activeTabs = tabs.filter((tab) => tab.active && tab.id != null);
+  const activeTab = activeTabs.find((tab) => tab.windowId === lastActiveWindowId)
+    || (activeTabs.length === 1 ? activeTabs[0] : null);
+  if (activeTab) {
+    rememberActiveTab(activeTab.id, activeTab.windowId);
+  }
 
   for (const tab of tabs) {
     try {
-      if (!tab.id || !tab.url) {
+      if (tab.id == null || !tab.url) {
         continue;
       }
 
@@ -578,8 +889,21 @@ function runTabScan() {
   return scanInFlight;
 }
 
-async function sleepCurrentTab() {
-  const [tab] = await api.tabs.query({ active: true, currentWindow: true });
+async function sleepCurrentTab(hint = {}) {
+  const baseSettings = await readSettings();
+  const companionResult = await readLocalJson(baseSettings, '/sleep-current', {
+    timeoutMs: 9000,
+    fetchOptions: {
+      method: 'POST',
+      headers: companionMutationHeaders(),
+      body: '{}',
+    },
+  });
+  if (companionResult?.ok) {
+    return companionResult;
+  }
+
+  const { tab } = await resolveCurrentTab(hint);
   if (!tab) {
     return { ok: false, reason: 'missing-active-tab' };
   }
@@ -609,17 +933,12 @@ async function sleepInactiveYouTubeTabs() {
 }
 
 async function sleepAllExceptCurrent() {
-  const [currentTab] = await api.tabs.query({ active: true, currentWindow: true });
-  if (!currentTab?.id) {
-    return { ok: false, reason: 'missing-active-tab' };
-  }
-
   const tabs = await api.tabs.query({});
   const { settings } = await readRuntimeSettings();
   const results = [];
 
   for (const tab of tabs) {
-    if (!tab.id || tab.id === currentTab.id) {
+    if (tab.id == null || tab.active) {
       continue;
     }
 
@@ -640,7 +959,7 @@ async function freeMemoryNow() {
   const results = [];
 
   for (const tab of tabs) {
-    if (!tab?.id || tab.active || !isPressureDomain(tab.url, settings)) {
+    if (tab?.id == null || tab.active || !isPressureDomain(tab.url, settings)) {
       continue;
     }
 
@@ -691,7 +1010,7 @@ async function restoreAllSleepingTabs() {
 
   for (const [token, entry] of Object.entries(sleepingTabs)) {
     const restorableUrl = normalizeRestorableUrl(entry?.url);
-    if (!entry?.tabId || !restorableUrl) {
+    if (entry?.tabId == null || !restorableUrl) {
       skippedCount += 1;
       continue;
     }
@@ -715,16 +1034,34 @@ async function restoreAllSleepingTabs() {
   return { ok: true, restoredCount, skippedCount };
 }
 
-async function toggleCurrentDomainInAllowlist() {
-  const [tab] = await api.tabs.query({ active: true, currentWindow: true });
+async function toggleCurrentDomainInAllowlist(hint = {}) {
+  const settings = await readSettings();
+  const { tab } = await resolveCurrentTab(hint);
   const host = hostnameFromUrl(tab?.url);
   if (!host) {
     return { ok: false, reason: 'missing-domain' };
   }
 
-  const settings = await readSettings();
   const result = toggleAllowlistForHost(settings.allowlist ?? [], host);
 
+  await writeSettings({ ...settings, allowlist: result.allowlist });
+  return {
+    ok: true,
+    enabled: result.enabled,
+    domain: host,
+    settings: await readSettings(),
+  };
+}
+
+async function setCurrentDomainAllowlisted(hint = {}, enabled = true) {
+  const settings = await readSettings();
+  const { tab } = await resolveCurrentTab(hint);
+  const host = hostnameFromUrl(tab?.url);
+  if (!host) {
+    return { ok: false, reason: 'missing-domain' };
+  }
+
+  const result = setAllowlistForHost(settings.allowlist ?? [], host, enabled);
   await writeSettings({ ...settings, allowlist: result.allowlist });
   return {
     ok: true,
@@ -744,10 +1081,9 @@ async function setProfile(profile) {
   return { ok: true, settings: await readSettings() };
 }
 
-async function getPopupState() {
-  const [tab] = await api.tabs.query({ active: true, currentWindow: true });
+async function getPopupState(hint = {}) {
   const { settings, powerStatus } = await readRuntimeSettings();
-  const state = tab?.id ? await getTabState(tab.id) : {};
+  const { tab, state } = await resolveCurrentTab(hint);
   const sleepingTabs = await readCurrentSleepingTabs(settings);
   const token = tab?.url ? extractKnownSleepToken(tab.url, settings) : null;
   const sleepEntry = token ? sleepingTabs[token] : null;
@@ -763,6 +1099,13 @@ async function getPopupState() {
     reasonLabel: sleepEntry ? formatReason(sleepEntry.reason) : '',
     currentHost: hostnameFromUrl(effectiveUrl),
     sleepingTabs: sleepingTabsListFromStore(sleepingTabs),
+    activeTabDebug: {
+      ...activeTabDebug,
+      resolvedTabId: tab?.id ?? null,
+      resolvedUrl: tab?.url || '',
+      statePageUrl: state.pageUrl || '',
+      stateUrl: state.url || '',
+    },
   };
 }
 
@@ -803,14 +1146,13 @@ async function resetYouTubeCounter(tabId) {
 }
 
 api.runtime.onInstalled.addListener(async () => {
-  const result = await api.storage.local.get(STORAGE_KEYS.settings);
-  if (!result[STORAGE_KEYS.settings]) {
-    await writeSettings(DEFAULT_SETTINGS);
-  }
+  const settings = await readSettings();
+  await syncExtensionHeartbeat(settings);
   api.alarms.create(SCAN_ALARM, { periodInMinutes: 1 });
 });
 
 api.runtime.onStartup?.addListener(() => {
+  void readSettings().then(syncExtensionHeartbeat);
   api.alarms.create(SCAN_ALARM, { periodInMinutes: 1 });
 });
 
@@ -820,7 +1162,8 @@ api.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-api.tabs.onActivated.addListener(({ tabId }) => {
+api.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  rememberActiveTab(tabId, windowId);
   void markTabActive(tabId);
 });
 
@@ -830,12 +1173,16 @@ api.windows.onFocusChanged?.addListener(async (windowId) => {
   }
 
   const [tab] = await api.tabs.query({ active: true, windowId });
-  if (tab?.id) {
+  if (tab?.id != null) {
+    rememberActiveTab(tab.id, windowId);
     await markTabActive(tab.id);
   }
 });
 
 api.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (tab.active) {
+    rememberActiveTab(tabId, tab.windowId);
+  }
   if (changeInfo.url || changeInfo.title || changeInfo.status === 'complete') {
     void patchTabState(tabId, {
       title: tab.title,
@@ -853,22 +1200,27 @@ api.tabs.onRemoved.addListener((tabId) => {
 async function handleRuntimeMessage(message, sender) {
   const tabId = sender?.tab?.id;
 
-  if (message?.type === 'tab-sleeper:page-state' && tabId) {
+  if (message?.type === 'tab-sleeper:page-state' && tabId != null) {
+    if (sender.tab?.active) {
+      rememberActiveTab(tabId, sender.tab.windowId);
+    }
     const existingState = sender.tab ? await ensureTabState(sender.tab) : await getTabState(tabId);
     const youtubeState = mergeYouTubePageState(existingState, message);
     await patchTabState(tabId, {
       dirty: Boolean(message.dirty),
+      pageUrl: message.pageUrl,
+      pageTitle: message.pageTitle,
       ...youtubeState,
     });
     return { ok: true };
   }
 
   if (message?.type === 'tab-sleeper:get-popup-state') {
-    return getPopupState();
+    return getPopupState(message);
   }
 
   if (message?.type === 'tab-sleeper:sleep-current') {
-    return sleepCurrentTab();
+    return sleepCurrentTab(message);
   }
 
   if (message?.type === 'tab-sleeper:sleep-inactive-youtube') {
@@ -914,11 +1266,19 @@ async function handleRuntimeMessage(message, sender) {
   }
 
   if (message?.type === 'tab-sleeper:toggle-allowlist-current') {
-    return toggleCurrentDomainInAllowlist();
+    return toggleCurrentDomainInAllowlist(message);
   }
 
-  if (message?.type === 'tab-sleeper:reset-youtube-counter' && tabId) {
-    await resetYouTubeCounter(tabId);
+  if (message?.type === 'tab-sleeper:set-allowlist-current') {
+    return setCurrentDomainAllowlisted(message, message.enabled !== false);
+  }
+
+  if (message?.type === 'tab-sleeper:reset-youtube-counter') {
+    const targetTabId = tabId ?? Number(message.currentTabId);
+    if (!Number.isInteger(targetTabId) || targetTabId < 0) {
+      return { ok: false, reason: 'missing-active-tab' };
+    }
+    await resetYouTubeCounter(targetTabId);
     return { ok: true };
   }
 
@@ -928,4 +1288,5 @@ async function handleRuntimeMessage(message, sender) {
 api.runtime.onMessage.addListener(makeRuntimeMessageListener(handleRuntimeMessage));
 
 api.alarms.create(SCAN_ALARM, { periodInMinutes: 1 });
+void readSettings().then(syncExtensionHeartbeat);
 void runTabScan();

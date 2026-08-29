@@ -219,7 +219,7 @@ export function isLocalSleepPageUrl(candidateUrl, serverUrl = DEFAULT_SETTINGS.s
   try {
     const sleepUrl = new URL(serverUrl);
     const candidate = new URL(candidateUrl);
-    return candidate.origin === sleepUrl.origin && candidate.pathname === sleepUrl.pathname;
+    return urlsHaveSameAuthority(candidate, sleepUrl) && candidate.pathname === sleepUrl.pathname;
   } catch {
     return false;
   }
@@ -229,10 +229,22 @@ export function isSleepPageUrl(candidateUrl, runtimeBaseUrl) {
   try {
     const sleepUrl = new URL('sleep/sleep.html', runtimeBaseUrl);
     const candidate = new URL(candidateUrl);
-    return candidate.origin === sleepUrl.origin && candidate.pathname === sleepUrl.pathname;
+    return urlsHaveSameAuthority(candidate, sleepUrl) && candidate.pathname === sleepUrl.pathname;
   } catch {
     return false;
   }
+}
+
+export function isKnownSleepPageUrl(candidateUrl, settings = DEFAULT_SETTINGS, runtimeBaseUrl = '') {
+  const normalizedSettings = mergeSettings(settings);
+  return isLocalSleepPageUrl(candidateUrl, normalizedSettings.sleepServerUrl)
+    || Boolean(runtimeBaseUrl && isSleepPageUrl(candidateUrl, runtimeBaseUrl));
+}
+
+function urlsHaveSameAuthority(left, right) {
+  return left.protocol === right.protocol
+    && left.hostname === right.hostname
+    && left.port === right.port;
 }
 
 export function extractSleepToken(candidateUrl, runtimeBaseUrl) {
@@ -468,52 +480,28 @@ function parseHttpUrl(value) {
   return '';
 }
 
-function collectReaderCandidates(value) {
-  const candidates = [];
-  const add = (candidate) => {
-    const text = String(candidate || '').trim();
-    if (text && !candidates.includes(text)) {
-      candidates.push(text);
-    }
-  };
-
-  add(value);
-
-  let decoded = String(value || '').trim();
-  for (let i = 0; i < 3; i += 1) {
-    const next = decodeURIComponentSafely(decoded);
-    if (next === decoded) {
-      break;
-    }
-    decoded = next;
-    add(decoded);
-  }
-
-  for (const candidate of [...candidates]) {
-    try {
-      const parsed = new URL(candidate);
-      for (const key of ['url', 'u', 'target']) {
-        add(parsed.searchParams.get(key));
-      }
-    } catch {
-      // Reader-like URLs are often malformed for the URL parser after decoding.
-    }
-
-    const matches = candidate.match(/https?:\/\/[^\s"'<>]+/gi) || [];
-    for (const match of matches) {
-      add(match.replace(/[),.;]+$/, ''));
-    }
-  }
-
-  return candidates;
-}
-
 export function normalizeRestorableUrl(value) {
   const unwrappedValue = unwrapNestedSleepUrl(value);
-  for (const candidate of collectReaderCandidates(unwrappedValue)) {
-    const restorable = parseHttpUrl(candidate);
-    if (restorable) {
-      return restorable;
+  const directUrl = parseHttpUrl(unwrappedValue);
+  if (directUrl) {
+    return directUrl;
+  }
+  return parseSupportedReaderUrl(unwrappedValue);
+}
+
+function parseSupportedReaderUrl(value) {
+  const text = String(value || '').trim();
+  if (text.startsWith('about:reader?')) {
+    try {
+      return parseHttpUrl(new URL(text).searchParams.get('url'));
+    } catch {
+      return '';
+    }
+  }
+
+  for (const prefix of ['x-safari-reader://', 'safari-reader://']) {
+    if (text.toLowerCase().startsWith(prefix)) {
+      return parseHttpUrl(decodeURIComponentSafely(text.slice(prefix.length)));
     }
   }
 
@@ -571,7 +559,7 @@ function isKnownSleepWrapper(parsed) {
   if ((host === '127.0.0.1' || host === 'localhost') && pathname === '/sleep') {
     return true;
   }
-  return INTERNAL_PROTOCOLS.has(protocol) && pathname.endsWith('/sleep/sleep.html');
+  return false;
 }
 
 function base64UrlEncode(value) {
@@ -647,7 +635,11 @@ export function isAggressiveDomain(url, settings = DEFAULT_SETTINGS) {
 }
 
 export function isPressureDomain(url, settings = DEFAULT_SETTINGS) {
-  return isDomainMatched(url, settings.pressureDomains ?? DEFAULT_SETTINGS.pressureDomains);
+  const normalizedSettings = mergeSettings(settings);
+  if (isLocalSleepPageUrl(url, normalizedSettings.sleepServerUrl)) {
+    return false;
+  }
+  return isDomainMatched(url, normalizedSettings.pressureDomains);
 }
 
 export function buildSleepDecision({ tab, state = {}, settings = DEFAULT_SETTINGS, now = Date.now(), runtimeBaseUrl = '' }) {
@@ -716,7 +708,7 @@ export function getTabEligibility({ tab, state = {}, settings = DEFAULT_SETTINGS
     return { eligible: false, reason: 'audible-tab' };
   }
 
-  if (runtimeBaseUrl && isSleepPageUrl(tab.url, runtimeBaseUrl)) {
+  if (isKnownSleepPageUrl(tab.url, settings, runtimeBaseUrl)) {
     return { eligible: false, reason: 'already-sleeping' };
   }
 
@@ -762,11 +754,27 @@ export function toggleAllowlistForHost(allowlist = [], host = '') {
 
   const targetUrl = `https://${normalizedHost}/`;
   const isEnabled = isAllowlisted(targetUrl, normalizedAllowlist);
-  const nextAllowlist = isEnabled
-    ? normalizedAllowlist.filter((entry) => !isAllowlisted(targetUrl, [entry]))
-    : Array.from(new Set([...normalizedAllowlist, normalizedHost])).sort();
+  return setAllowlistForHost(normalizedAllowlist, normalizedHost, !isEnabled);
+}
 
-  return { enabled: !isEnabled, allowlist: nextAllowlist };
+export function setAllowlistForHost(allowlist = [], host = '', enabled = true) {
+  const normalizedHost = String(host || '').trim().toLowerCase();
+  const normalizedAllowlist = normalizeAllowlist(allowlist);
+  if (!normalizedHost) {
+    return { enabled: false, allowlist: normalizedAllowlist };
+  }
+
+  const targetUrl = `https://${normalizedHost}/`;
+  const isEnabled = isAllowlisted(targetUrl, normalizedAllowlist);
+  if (Boolean(enabled) === isEnabled) {
+    return { enabled: isEnabled, allowlist: normalizedAllowlist };
+  }
+
+  const nextAllowlist = enabled
+    ? Array.from(new Set([...normalizedAllowlist, normalizedHost])).sort()
+    : normalizedAllowlist.filter((entry) => !isAllowlisted(targetUrl, [entry]));
+
+  return { enabled: Boolean(enabled), allowlist: nextAllowlist };
 }
 
 function isDomainMatched(url, patterns = []) {

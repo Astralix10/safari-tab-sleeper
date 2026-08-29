@@ -6,6 +6,7 @@ import {
   applyProfile,
   applyPowerMode,
   buildLocalSleepPageUrl,
+  buildManualSleepDecision,
   buildSleepDecision,
   buildSleepPageUrl,
   chooseUnloadStrategy,
@@ -17,6 +18,7 @@ import {
   getSleepPageAutoRestoreDelay,
   isAggressiveDomain,
   isAllowlisted,
+  isKnownSleepPageUrl,
   isPressureDomain,
   isSleepPageUrl,
   makeRuntimeMessageListener,
@@ -24,6 +26,7 @@ import {
   normalizeAllowlist,
   normalizeRestorableUrl,
   reconcileSleepingTabsWithOpenTabs,
+  setAllowlistForHost,
   shouldHealStuckSleepTab,
   shouldAutoRestoreSleepPage,
   shouldTreatYouTubeAsHighRisk,
@@ -137,6 +140,37 @@ test('allowlist toggle removes the matching YouTube family without touching othe
     toggleAllowlistForHost(['*.example.com'], 'www.youtube.com'),
     { enabled: true, allowlist: ['*.example.com', 'www.youtube.com'] },
   );
+});
+
+test('explicit allowlist state is idempotent for repeated switch events', () => {
+  assert.deepEqual(
+    setAllowlistForHost([], 'www.youtube.com', true),
+    { enabled: true, allowlist: ['www.youtube.com'] },
+  );
+  assert.deepEqual(
+    setAllowlistForHost(['www.youtube.com'], 'www.youtube.com', true),
+    { enabled: true, allowlist: ['www.youtube.com'] },
+  );
+  assert.deepEqual(
+    setAllowlistForHost(['www.youtube.com', '*.example.com'], 'music.youtube.com', false),
+    { enabled: false, allowlist: ['*.example.com'] },
+  );
+});
+
+test('manual sleep cannot bypass a protected site', () => {
+  const decision = buildManualSleepDecision({
+    tab: {
+      id: 17,
+      active: true,
+      audible: false,
+      pinned: false,
+      url: 'https://www.youtube.com/watch?v=protected',
+    },
+    state: { dirty: false },
+    settings: { ...DEFAULT_SETTINGS, allowlist: ['youtube.com'] },
+  });
+
+  assert.deepEqual(decision, { eligible: false, reason: 'allowlisted' });
 });
 
 test('profiles tune sleep timing and media behavior', () => {
@@ -301,6 +335,8 @@ test('sleep page URLs use opaque tokens instead of leaking original URLs', () =>
   assert.equal(url, 'safari-web-extension://example-id/sleep/sleep.html?token=abc123');
   assert.equal(isSleepPageUrl(url, runtimeUrl), true);
   assert.equal(url.includes('youtube.com'), false);
+  assert.equal(isSleepPageUrl('safari-web-extension://foreign-id/sleep/sleep.html?token=abc123', runtimeUrl), false);
+  assert.equal(isKnownSleepPageUrl(url, DEFAULT_SETTINGS, runtimeUrl), true);
 });
 
 test('local sleep server URLs survive Safari session restore without leaking the original URL plainly', () => {
@@ -317,6 +353,15 @@ test('local sleep server URLs survive Safari session restore without leaking the
   assert.equal(url.startsWith('http://127.0.0.1:17654/sleep#fallback='), true);
   assert.equal(url.includes('mail.google.com'), false);
   assert.deepEqual(decodeSleepFallback(new URL(url).hash), entry);
+  assert.equal(isKnownSleepPageUrl(url, DEFAULT_SETTINGS), true);
+  assert.deepEqual(
+    buildManualSleepDecision({
+      tab: { id: 1, active: true, pinned: false, audible: false, url },
+      state: {},
+      settings: DEFAULT_SETTINGS,
+    }),
+    { eligible: false, reason: 'already-sleeping' },
+  );
 });
 
 test('nested local sleep URLs unwrap to the original page', () => {
@@ -372,6 +417,11 @@ test('sleep fallback restores Safari Reader URLs as normal web URLs', () => {
   }));
 
   assert.equal(decoded.url, 'https://example.com/story?id=42');
+});
+
+test('restorable URL normalization never extracts a web URL from script text', () => {
+  assert.equal(normalizeRestorableUrl("javascript:location='https://evil.example/'"), '');
+  assert.equal(normalizeRestorableUrl('not a URL https://evil.example/'), '');
 });
 
 
@@ -586,5 +636,12 @@ test('pressure domains include common heavy web apps and support custom addition
   assert.equal(isPressureDomain('https://meet.google.com/abc-defg-hij', DEFAULT_SETTINGS), true);
   assert.equal(isPressureDomain('https://www.figma.com/file/abc', DEFAULT_SETTINGS), true);
   assert.equal(isPressureDomain('https://example.com/', DEFAULT_SETTINGS), false);
+  assert.equal(isPressureDomain('https://youtube.com.evil.example/', DEFAULT_SETTINGS), false);
+  assert.equal(isPressureDomain('https://evil.example/?next=youtube.com', DEFAULT_SETTINGS), false);
+  assert.equal(isPressureDomain(buildLocalSleepPageUrl(DEFAULT_SETTINGS.sleepServerUrl, {
+    token: 'sleep-token',
+    url: 'https://www.youtube.com/watch?v=abc',
+    title: 'Video',
+  }), DEFAULT_SETTINGS), false);
   assert.equal(isPressureDomain('https://video.internal.test/', { ...DEFAULT_SETTINGS, pressureDomains: ['video.internal.test'] }), true);
 });

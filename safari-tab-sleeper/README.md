@@ -18,7 +18,7 @@ It targets the annoying case where long-lived tabs, especially YouTube, keep lar
 - Tracks long YouTube sessions inside one tab and sleeps risky inactive YouTube tabs faster.
 - Provides popup actions:
   - sleep current tab
-  - sleep all except current
+  - sleep every background tab while preserving the active tab in each Safari window
   - wake all sleeping tabs
   - sleep heavy background tabs
   - free memory now
@@ -26,6 +26,7 @@ It targets the annoying case where long-lived tabs, especially YouTube, keep lar
   - reset the YouTube counter
 - Shows Safari/WebKit memory and current power mode in the popup.
 - Uses a local recovery archive for sleeping-tab URLs.
+- Pairs mutating localhost requests to the installed extension origin and requires a private token.
 - Automatically compacts duplicate archived URLs so the archive does not grow forever.
 - Rejects nested sleep-page URLs and atomically writes the recovery archive.
 - Serializes tab-state updates so simultaneous Safari events cannot erase counters or restore records.
@@ -33,6 +34,7 @@ It targets the annoying case where long-lived tabs, especially YouTube, keep lar
 - Runs a companion monitor that silently cleans heavy background tabs around 3 GB and sends normal Notification Center alerts around 5 GB.
 - Reports system swap for context but never attributes global swap to Safari or uses it alone to trigger cleanup.
 - Waits for extension settings sync before the companion performs forced memory cleanup.
+- Bounds companion server logs and ignores normal client disconnect noise.
 
 ## Honest Limitation
 
@@ -54,6 +56,12 @@ The Xcode Safari App Extension wrapper lives in the sibling project:
 ```
 
 ## Build The Safari App
+
+Generate or reuse the local companion token before building. The generated JavaScript file is ignored by Git:
+
+```zsh
+./companion/install-launch-agent.zsh
+```
 
 Release build:
 
@@ -111,7 +119,9 @@ Useful endpoints:
 - `/health`: health check.
 - `/memory`: Safari/WebKit memory summary.
 - `/power`: battery or power-adapter status.
+- `/extension-state`: recent background-worker heartbeat used when SafariServices cannot report extension state.
 - `/settings`: synced allowlist used by companion AppleScript cleanup.
+- `/sleep-current`: sleeps the actual front Safari tab through the local companion.
 - `/sleep`: lightweight sleep page.
 - `/archive-entry`: local backup store for sleeping-tab restore data.
 
@@ -138,6 +148,10 @@ npm test
 npm run check:scripts
 npm run build:menubar
 ```
+
+## Release 0.3.8
+
+This release addresses the complete 0.3.7 QA report: reliable current-tab sleeping, idempotent sleep pages, exact hostname pressure matching, paired companion mutations, Release entitlements, visible native errors with a live extension-heartbeat fallback, direct power status, strict extension-origin matching, reset-ID validation, bounded logs, client-error JSON responses, numeric CLI validation, and strict restore URL parsing.
 
 ## Notes For YouTube
 
