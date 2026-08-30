@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { request as httpRequest } from 'node:http';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,8 +11,20 @@ process.env.SAFARI_TAB_SLEEPER_MUTATION_TOKEN = MUTATION_TOKEN;
 const mutationHeaders = (extra = {}) => ({
   'content-type': 'application/json',
   'x-safari-tab-sleeper-token': MUTATION_TOKEN,
+  'x-safari-tab-sleeper-native': '1',
   ...extra,
 });
+
+function requestStatus({ port, path = '/', headers = {} }) {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({ hostname: '127.0.0.1', port, path, headers }, (response) => {
+      response.resume();
+      response.on('end', () => resolve(response.statusCode));
+    });
+    request.on('error', reject);
+    request.end();
+  });
+}
 
 async function waitForHealth(port) {
   const url = `http://127.0.0.1:${port}/health`;
@@ -45,7 +58,7 @@ test('sleep server exposes current Safari memory status as JSON', async () => {
 
   try {
     await waitForHealth(port);
-    const response = await fetch(`http://127.0.0.1:${port}/memory`);
+    const response = await fetch(`http://127.0.0.1:${port}/memory`, { headers: mutationHeaders() });
     assert.equal(response.ok, true);
     assert.match(response.headers.get('content-type') ?? '', /application\/json/);
 
@@ -261,7 +274,7 @@ test('sleep server exposes power source status', async () => {
 
   try {
     await waitForHealth(port);
-    const response = await fetch(`http://127.0.0.1:${port}/power`);
+    const response = await fetch(`http://127.0.0.1:${port}/power`, { headers: mutationHeaders() });
     assert.equal(response.ok, true);
     const body = await response.json();
     assert.equal(body.ok, true);
@@ -371,12 +384,15 @@ test('sleep server rejects settings writes from ordinary web pages', async () =>
     assert.equal(accepted.ok, true);
     assert.equal(accepted.headers.get('access-control-allow-origin'), trustedOrigin);
 
-    const unrelated = await fetch(`http://127.0.0.1:${port}/settings`, {
+    const rotatedOrigin = 'safari-web-extension://rotated-after-update';
+    const rotated = await fetch(`http://127.0.0.1:${port}/settings`, {
       method: 'POST',
-      headers: mutationHeaders({ origin: 'safari-web-extension://unrelated-extension' }),
-      body: JSON.stringify({ allowlist: ['evil.example'] }),
+      headers: mutationHeaders({ origin: rotatedOrigin }),
+      body: JSON.stringify({ allowlist: ['rotated.example'] }),
     });
-    assert.equal(unrelated.status, 403);
+    assert.equal(rotated.ok, true);
+    assert.equal(rotated.headers.get('access-control-allow-origin'), rotatedOrigin);
+    assert.equal(await readFile(join(dir, 'trusted-origin.txt'), 'utf8'), `${rotatedOrigin}\n`);
   } finally {
     server.kill();
   }
@@ -432,6 +448,63 @@ test('sleep-current endpoint returns the companion automation result', async () 
     const body = await response.json();
     assert.equal(body.ok, true);
     assert.equal(body.sleptCount, 1);
+  } finally {
+    server.kill();
+  }
+});
+
+test('sleep server validates Host, protects sensitive reads, and rejects empty settings', async () => {
+  const port = 27000 + Math.floor(Math.random() * 300);
+  const dir = await mkdtemp(join(tmpdir(), 'safari-tab-sleeper-security-'));
+  const server = spawn('python3', ['companion/sleeper-server.py'], {
+    cwd: new URL('..', import.meta.url),
+    env: {
+      ...process.env,
+      SAFARI_TAB_SLEEPER_PORT: String(port),
+      SAFARI_TAB_SLEEPER_ALLOWLIST_PATH: join(dir, 'allowlist.txt'),
+      SAFARI_TAB_SLEEPER_SETTINGS_PATH: join(dir, 'settings.json'),
+      SAFARI_TAB_SLEEPER_SETTINGS_READY_PATH: join(dir, 'settings-ready'),
+    },
+    stdio: 'ignore',
+  });
+
+  try {
+    await waitForHealth(port);
+    const base = `http://127.0.0.1:${port}`;
+    assert.equal((await fetch(`${base}/memory`)).status, 403);
+    assert.equal(await requestStatus({
+      port,
+      path: '/memory',
+      headers: mutationHeaders({ host: `attacker.example:${port}` }),
+    }), 421);
+
+    const saved = await fetch(`${base}/settings`, {
+      method: 'POST',
+      headers: mutationHeaders(),
+      body: JSON.stringify({ allowlist: ['protected.example'], pressureDomains: ['video.example'] }),
+    });
+    assert.equal(saved.ok, true);
+
+    const rejected = await fetch(`${base}/settings`, {
+      method: 'POST',
+      headers: mutationHeaders(),
+      body: '{}',
+    });
+    assert.equal(rejected.status, 400);
+
+    const current = await fetch(`${base}/settings`, { headers: mutationHeaders() }).then((response) => response.json());
+    assert.deepEqual(current.allowlist, ['protected.example']);
+    assert.deepEqual(current.pressureDomains, ['video.example']);
+
+    const queued = await fetch(`${base}/cleanup-request`, {
+      method: 'POST',
+      headers: mutationHeaders(),
+      body: JSON.stringify({ action: 'queue', totalMb: 4096, maxMb: 3500 }),
+    }).then((response) => response.json());
+    assert.equal(queued.queued, true);
+    const pending = await fetch(`${base}/cleanup-request`, { headers: mutationHeaders() }).then((response) => response.json());
+    assert.equal(pending.pending, true);
+    assert.equal(pending.requestId, queued.requestId);
   } finally {
     server.kill();
   }

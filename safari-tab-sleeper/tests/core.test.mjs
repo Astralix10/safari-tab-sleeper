@@ -212,14 +212,7 @@ test('power-aware mode sleeps faster on battery and softer on power', () => {
 
 test('stuck active sleep tabs are eligible for a retry healer', () => {
   const settings = mergeSettings({});
-  const sleepUrl = buildLocalSleepPageUrl(settings.sleepServerUrl, {
-    token: 'heal-token',
-    url: 'https://example.com/report',
-    title: 'Report',
-    sleptAt: 1_000,
-    reason: 'inactive-timeout',
-    autoRestore: true,
-  });
+  const sleepUrl = buildLocalSleepPageUrl(settings.sleepServerUrl, 'heal-token');
 
   assert.equal(
     shouldHealStuckSleepTab({
@@ -348,11 +341,10 @@ test('local sleep server URLs survive Safari session restore without leaking the
     reason: 'inactive-timeout',
     autoRestore: true,
   };
-  const url = buildLocalSleepPageUrl('http://127.0.0.1:17654/sleep', entry);
+  const url = buildLocalSleepPageUrl('http://127.0.0.1:17654/sleep', entry.token);
 
-  assert.equal(url.startsWith('http://127.0.0.1:17654/sleep#fallback='), true);
+  assert.equal(url, 'http://127.0.0.1:17654/sleep#token=abc123');
   assert.equal(url.includes('mail.google.com'), false);
-  assert.deepEqual(decodeSleepFallback(new URL(url).hash), entry);
   assert.equal(isKnownSleepPageUrl(url, DEFAULT_SETTINGS), true);
   assert.deepEqual(
     buildManualSleepDecision({
@@ -364,22 +356,22 @@ test('local sleep server URLs survive Safari session restore without leaking the
   );
 });
 
-test('nested local sleep URLs unwrap to the original page', () => {
+test('legacy nested sleep URLs still unwrap to the original page', () => {
   const originalUrl = 'https://www.youtube.com/watch?v=original';
-  const firstSleepUrl = buildLocalSleepPageUrl('http://127.0.0.1:17654/sleep', {
+  const firstSleepUrl = `http://127.0.0.1:17654/sleep${encodeSleepFallback({
     token: 'first',
     url: originalUrl,
     title: 'Original video',
     sleptAt: 1,
     reason: 'memory-pressure',
-  });
-  const nestedSleepUrl = buildLocalSleepPageUrl('http://127.0.0.1:17654/sleep', {
+  })}`;
+  const nestedSleepUrl = `http://127.0.0.1:17654/sleep${encodeSleepFallback({
     token: 'second',
     url: firstSleepUrl,
     title: '[sleep] Original video',
     sleptAt: 2,
     reason: 'memory-pressure',
-  });
+  })}`;
 
   assert.equal(normalizeRestorableUrl(nestedSleepUrl), originalUrl);
 
@@ -440,7 +432,7 @@ test('runtime message listener replies through sendResponse for callback-based S
   assert.deepEqual(responses, [{ ok: true, echo: 42 }]);
 });
 
-test('sleep fallback survives without storage and keeps the original URL out of the query string', () => {
+test('modern sleep links contain only an opaque token', () => {
   const entry = {
     token: 'abc123',
     url: 'https://www.youtube.com/watch?v=abc',
@@ -450,12 +442,12 @@ test('sleep fallback survives without storage and keeps the original URL out of 
     autoRestore: true,
   };
   const encoded = encodeSleepFallback(entry);
-  const pageUrl = buildSleepPageUrl('safari-web-extension://example-id/', entry.token, entry);
+  const pageUrl = buildSleepPageUrl('safari-web-extension://example-id/', entry.token);
 
   assert.equal(pageUrl.includes('token=abc123'), true);
   assert.equal(pageUrl.includes('youtube.com'), false);
   assert.deepEqual(decodeSleepFallback(encoded), entry);
-  assert.deepEqual(decodeSleepFallback(new URL(pageUrl).hash), entry);
+  assert.equal(new URL(pageUrl).hash, '');
 });
 
 test('sleeping tab storage is pruned to currently open sleeping tabs', () => {
@@ -496,11 +488,11 @@ test('sleeping tab storage is pruned to currently open sleeping tabs', () => {
     [
       {
         id: 12,
-        url: buildSleepPageUrl('safari-web-extension://example-id/', 'live-token', liveEntry),
+        url: buildSleepPageUrl('safari-web-extension://example-id/', 'live-token'),
       },
       {
         id: 34,
-        url: buildLocalSleepPageUrl(DEFAULT_SETTINGS.sleepServerUrl, localEntry),
+        url: buildLocalSleepPageUrl(DEFAULT_SETTINGS.sleepServerUrl, localEntry.token),
       },
       {
         id: 56,
@@ -577,21 +569,23 @@ test('sleep reason tags are compact and stable', () => {
   assert.equal(getSleepReasonTag('manual-all-except-current'), 'manual');
 });
 
-test('sleeping tab icon prefers original favicon and falls back to site favicon', () => {
+test('sleeping tab icon never contacts the original site', () => {
   assert.equal(
     getSleepingTabIconUrl({
       pageUrl: 'https://www.youtube.com/watch?v=abc',
       favIconUrl: 'https://www.youtube.com/s/desktop/favicon.ico',
     }),
-    'https://www.youtube.com/s/desktop/favicon.ico',
+    '',
   );
   assert.equal(
     getSleepingTabIconUrl({
       pageUrl: 'https://www.youtube.com/watch?v=abc',
       favIconUrl: '',
     }),
-    'https://www.youtube.com/favicon.ico',
+    '',
   );
+  const embedded = 'data:image/png;base64,AA==';
+  assert.equal(getSleepingTabIconUrl({ pageUrl: 'https://example.com', favIconUrl: embedded }), embedded);
   assert.equal(
     getSleepingTabIconUrl({
       pageUrl: 'file:///tmp/local.html',

@@ -3,8 +3,6 @@ tell application "Safari"
 	if (count of windows) is 0 then error "В Safari нет окон."
 	set targetTab to current tab of front window
 	set originalURL to URL of targetTab
-	set URL of targetTab to "about:blank"
-	delay 0.2
 	set URL of targetTab to originalURL
 	return "Перезагружено: " & originalURL
 end tell

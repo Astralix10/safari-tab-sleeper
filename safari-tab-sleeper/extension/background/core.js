@@ -111,6 +111,9 @@ export function mergeSettings(settings = {}) {
 }
 
 function clampSettingNumber(value, fallback, limits) {
+  if (value === '' || value === null || value === undefined) {
+    return fallback;
+  }
   const numericValue = Number(value);
   if (!Number.isFinite(numericValue)) {
     return fallback;
@@ -198,20 +201,15 @@ export function normalizeAllowlist(value) {
     .filter(Boolean)));
 }
 
-export function buildSleepPageUrl(runtimeBaseUrl, token, fallbackEntry = null) {
+export function buildSleepPageUrl(runtimeBaseUrl, token) {
   const url = new URL('sleep/sleep.html', runtimeBaseUrl);
   url.searchParams.set('token', token);
-
-  if (fallbackEntry) {
-    url.hash = encodeSleepFallback(fallbackEntry).replace(/^#/, '');
-  }
-
   return url.toString();
 }
 
-export function buildLocalSleepPageUrl(serverUrl, fallbackEntry) {
+export function buildLocalSleepPageUrl(serverUrl, token) {
   const url = new URL(serverUrl);
-  url.hash = encodeSleepFallback(fallbackEntry).replace(/^#/, '');
+  url.hash = new URLSearchParams({ token: String(token || '') }).toString();
   return url.toString();
 }
 
@@ -265,7 +263,9 @@ export function extractLocalSleepToken(candidateUrl, serverUrl = DEFAULT_SETTING
   }
 
   try {
-    return decodeSleepFallback(new URL(candidateUrl).hash)?.token ?? null;
+    const candidate = new URL(candidateUrl);
+    const hash = new URLSearchParams(candidate.hash.replace(/^#/, ''));
+    return hash.get('token') || decodeSleepFallback(candidate.hash)?.token || null;
   } catch {
     return null;
   }
@@ -435,26 +435,16 @@ export function shouldAutoRestoreSleepPage({ entry, now = Date.now(), minimumSle
 
 export function getSleepingTabIconUrl({ pageUrl, favIconUrl = '' }) {
   const explicitIcon = String(favIconUrl || '').trim();
-  if (isHttpUrl(explicitIcon)) {
+  if (isEmbeddedIconUrl(explicitIcon)) {
     return explicitIcon;
   }
-
-  try {
-    const parsed = new URL(normalizeRestorableUrl(pageUrl) || pageUrl);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return '';
-    }
-
-    return `${parsed.origin}/favicon.ico`;
-  } catch {
-    return '';
-  }
+  return '';
 }
 
-function isHttpUrl(value) {
+function isEmbeddedIconUrl(value) {
   try {
     const parsed = new URL(value);
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    return parsed.protocol === 'data:' || parsed.protocol === 'blob:';
   } catch {
     return false;
   }
@@ -605,9 +595,11 @@ export function shouldTreatYouTubeAsHighRisk(url, state = {}, settings = DEFAULT
 }
 
 export function mergeYouTubePageState(existingState = {}, incomingState = {}) {
-  const previousCount = Math.max(0, Number(existingState.youtubeVideoCount ?? 0));
+  const previousNumericCount = Number(existingState.youtubeVideoCount ?? 0);
+  const previousCount = Number.isFinite(previousNumericCount) ? Math.max(0, previousNumericCount) : 0;
   const previousUrl = String(existingState.youtubeLastVideoUrl || '');
-  const incomingCount = Math.max(0, Number(incomingState.youtubeVideoCount ?? 0));
+  const incomingNumericCount = Number(incomingState.youtubeVideoCount ?? 0);
+  const incomingCount = Number.isFinite(incomingNumericCount) ? Math.max(0, incomingNumericCount) : 0;
   const incomingUrl = String(incomingState.youtubeLastVideoUrl || '');
 
   if (!incomingUrl) {
@@ -770,9 +762,22 @@ export function setAllowlistForHost(allowlist = [], host = '', enabled = true) {
     return { enabled: isEnabled, allowlist: normalizedAllowlist };
   }
 
-  const nextAllowlist = enabled
-    ? Array.from(new Set([...normalizedAllowlist, normalizedHost])).sort()
-    : normalizedAllowlist.filter((entry) => !isAllowlisted(targetUrl, [entry]));
+  if (!enabled) {
+    const exactEntries = normalizedAllowlist.filter((entry) => (
+      entry === normalizedHost
+      || (isYouTubeFamilyDomain(entry) && isYouTubeFamilyDomain(normalizedHost) && !entry.startsWith('*.'))
+    ));
+    if (exactEntries.length === 0 && isEnabled) {
+      return { enabled: true, allowlist: normalizedAllowlist, blockedByPattern: true };
+    }
+    const exactSet = new Set(exactEntries);
+    return {
+      enabled: false,
+      allowlist: normalizedAllowlist.filter((entry) => !exactSet.has(entry)),
+    };
+  }
+
+  const nextAllowlist = Array.from(new Set([...normalizedAllowlist, normalizedHost])).sort();
 
   return { enabled: Boolean(enabled), allowlist: nextAllowlist };
 }

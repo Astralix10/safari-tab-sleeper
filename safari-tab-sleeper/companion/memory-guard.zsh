@@ -191,7 +191,13 @@ measure_memory() {
       for (i=3; i<=NF; i++) {
         command = command (i == 3 ? "" : " ") $i
       }
-      if (command !~ /\/Safari\.app\/|\/Safari Technology Preview\.app\/|com\.apple\.Safari|\/WebKit\.framework\/|com\.apple\.WebKit/) next
+      safari_process = command ~ /^\/Applications\/Safari\.app\/Contents\/MacOS\/Safari([[:space:]]|$)/ \
+        || command ~ /^\/Applications\/Safari Technology Preview\.app\/Contents\/MacOS\/Safari Technology Preview([[:space:]]|$)/ \
+        || command ~ /^\/System\/Applications\/Safari\.app\/Contents\/MacOS\/Safari([[:space:]]|$)/ \
+        || command ~ /^\/System\/Volumes\/Preboot\/Cryptexes\/App\/System\/Applications\/Safari\.app\/Contents\/MacOS\/Safari([[:space:]]|$)/ \
+        || command ~ /^\/System\/Volumes\/Preboot\/Cryptexes\/App\/System\/Library\/StagedFrameworks\/Safari\/.*\/com\.apple\.WebKit\.(WebContent|GPU|Networking)([[:space:]]|$)/ \
+        || command ~ /^\/System\/Library\/.*\/com\.apple\.WebKit\.(WebContent|GPU|Networking)([[:space:]]|$)/
+      if (!safari_process) next
       total += rss
       if (rss > max) {
         max = rss
@@ -341,12 +347,32 @@ APPLESCRIPT
 }
 
 sleep_inactive_pressure_tabs() {
+  local total_mb="${1:-0}"
+  local max_mb="${2:-0}"
   if ! settings_are_synced; then
-    print "slept_count=0 settings_pending=1"
+    print "queued=0 settings_pending=1"
     return 0
   fi
 
-  osascript "$SCRIPT_DIR/sleep-inactive-youtube-tabs.applescript" "$SLEEP_SERVER_URL" "$SCRIPT_DIR/allowlist.txt" 2>/dev/null || true
+  local mutation_token
+  mutation_token="$(cat "$MUTATION_TOKEN_FILE" 2>/dev/null || true)"
+  if [[ -z "$mutation_token" ]]; then
+    print "queued=0 token_missing=1"
+    return 0
+  fi
+
+  local response
+  response="$(/usr/bin/curl --silent --fail --max-time 2 \
+    -H "Content-Type: application/json" \
+    -H "X-Safari-Tab-Sleeper-Token: $mutation_token" \
+    -H "X-Safari-Tab-Sleeper-Native: 1" \
+    --data "{\"action\":\"queue\",\"totalMb\":$total_mb,\"maxMb\":$max_mb}" \
+    "${SLEEP_SERVER_URL%/sleep}/cleanup-request" 2>/dev/null || true)"
+  if [[ "$response" == *'"queued": true'* ]]; then
+    print "queued=1"
+  else
+    print "queued=0"
+  fi
 }
 
 LAST_ALERT_AT="0"
@@ -384,26 +410,9 @@ while true; do
     pressure_result=""
     if [[ "$AUTO_SLEEP_PRESSURE_DOMAINS" == "1" && $(( now - LAST_CLEANUP_AT )) -ge "$CLEANUP_COOLDOWN_SECONDS" ]]; then
       LAST_CLEANUP_AT="$now"
-      pressure_result="$(sleep_inactive_pressure_tabs)"
-      slept_count="$(field_from_line "$pressure_result" "slept_count")"
-      slept_count="${slept_count:-0}"
-      if [[ "$slept_count" == "0" ]]; then
-        :
-      else
-        print -- "$(date '+%Y-%m-%d %H:%M:%S') pressure cleanup: $pressure_result"
-        sleep 2
-        after_line="$(measure_memory)"
-        after_total_mb="$(field_from_line "$after_line" "total_mb")"
-        after_swap_used_mb="$(field_from_line "$after_line" "swap_used_mb")"
-        if [[ "$over_alert" == "1" && $(( now - LAST_ALERT_AT )) -ge "$COOLDOWN_SECONDS" ]]; then
-          show_cleanup_summary "$slept_count" "$total_mb" "${after_total_mb:-$total_mb}" "$swap_used_mb" "${after_swap_used_mb:-$swap_used_mb}"
-          LAST_ALERT_AT="$now"
-        fi
-        if [[ "$ONCE" == "1" ]]; then
-          exit 0
-        fi
-        sleep_with_server_watchdog "$INTERVAL_SECONDS"
-        continue
+      pressure_result="$(sleep_inactive_pressure_tabs "$total_mb" "$max_mb")"
+      if [[ "$pressure_result" == *"queued=1"* ]]; then
+        print -- "$(date '+%Y-%m-%d %H:%M:%S') pressure cleanup requested: $pressure_result"
       fi
     fi
 

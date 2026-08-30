@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import base64
+import fcntl
 import hmac
 import json
 import os
@@ -27,6 +28,10 @@ SETTINGS_READY_PATH = os.environ.get(
     "SAFARI_TAB_SLEEPER_SETTINGS_READY_PATH",
     os.path.join(os.path.dirname(ALLOWLIST_PATH) or os.path.dirname(__file__), "settings-ready"),
 )
+SETTINGS_PATH = os.environ.get(
+    "SAFARI_TAB_SLEEPER_SETTINGS_PATH",
+    os.path.join(os.path.dirname(ALLOWLIST_PATH) or os.path.dirname(__file__), "companion-settings.json"),
+)
 TRUSTED_ORIGIN_PATH = os.environ.get(
     "SAFARI_TAB_SLEEPER_TRUSTED_ORIGIN_PATH",
     os.path.join(os.path.dirname(ALLOWLIST_PATH) or os.path.dirname(__file__), "trusted-extension-origin.txt"),
@@ -52,6 +57,7 @@ TRUSTED_EXTENSION_SCHEMES = (
     "moz-extension://",
 )
 MUTATION_HEADER = "X-Safari-Tab-Sleeper-Token"
+NATIVE_HEADER = "X-Safari-Tab-Sleeper-Native"
 MUTATION_TOKEN = os.environ.get(
     "SAFARI_TAB_SLEEPER_MUTATION_TOKEN",
     "",
@@ -64,7 +70,9 @@ ARCHIVE_LOCK = threading.RLock()
 SETTINGS_LOCK = threading.RLock()
 TRUSTED_ORIGIN_LOCK = threading.RLock()
 HEARTBEAT_LOCK = threading.RLock()
+CLEANUP_REQUEST_LOCK = threading.RLock()
 LAST_EXTENSION_HEARTBEAT = 0.0
+PENDING_CLEANUP_REQUEST = None
 EXTENSION_HEARTBEAT_MAX_AGE_SECONDS = 15 * 60
 
 SLEEP_HTML = r"""<!doctype html>
@@ -97,7 +105,9 @@ SLEEP_HTML = r"""<!doctype html>
   </main>
   <script>
     const params = new URLSearchParams(location.hash.slice(1));
-    const entry = decodeFallbackEntry(params.get('fallback')) || legacySleepEntry(params);
+    const token = params.get('token') || new URLSearchParams(location.search).get('token') || '';
+    let entry = decodeFallbackEntry(params.get('fallback')) || legacySleepEntry(params);
+    let restorableUrl = '';
     const title = document.querySelector('#title');
     const url = document.querySelector('#url');
     const restore = document.querySelector('#restore');
@@ -152,14 +162,7 @@ SLEEP_HTML = r"""<!doctype html>
     }
 
     function siteIcon(pageUrl, favIconUrl) {
-      try {
-        if (favIconUrl && /^https?:\/\//i.test(favIconUrl)) return favIconUrl;
-        const parsed = new URL(normalizeRestorableUrl(pageUrl) || pageUrl);
-        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return `${parsed.origin}/favicon.ico`;
-      } catch {
-        return '';
-      }
-      return '';
+      return /^data:|^blob:/i.test(String(favIconUrl || '')) ? favIconUrl : '';
     }
 
     function decodeURIComponentSafely(value) {
@@ -257,9 +260,9 @@ SLEEP_HTML = r"""<!doctype html>
       }, (manualReturn ? 0 : automaticDelay) + 180);
     }
 
-    const restorableUrl = normalizeRestorableUrl(entry?.url);
-
-    if (restorableUrl) {
+    function renderEntry() {
+      restorableUrl = normalizeRestorableUrl(entry?.url);
+      if (restorableUrl) {
       document.title = sleepingTitle(entry.title, entry.reason);
       title.textContent = entry.title || 'Спящая вкладка';
       url.textContent = `Исходный URL: ${restorableUrl}`;
@@ -279,11 +282,26 @@ SLEEP_HTML = r"""<!doctype html>
         scheduleRestoreOnReturn();
       });
       scheduleRestoreOnReturn();
-    } else {
-      title.textContent = 'Не удалось восстановить вкладку';
-      url.textContent = 'В локальной sleep-странице нет сохранённого исходного URL.';
-      restore.disabled = true;
+      } else {
+        title.textContent = 'Не удалось восстановить вкладку';
+        url.textContent = 'В локальной sleep-странице нет сохранённого исходного URL.';
+        restore.disabled = true;
+      }
     }
+
+    async function loadEntry() {
+      if (!entry && token) {
+        for (let attempt = 0; attempt < 12 && !entry; attempt += 1) {
+          try {
+            const response = await fetch(`/archive-entry?token=${encodeURIComponent(token)}`, { cache: 'no-store' });
+            if (response.ok) entry = (await response.json()).entry || null;
+          } catch {}
+          if (!entry) await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+      renderEntry();
+    }
+    loadEntry();
   </script>
 </body>
 </html>
@@ -329,7 +347,12 @@ def format_mb(value):
 
 def is_safari_process(command):
     return bool(re.search(
-        r"/Safari\.app/|/Safari Technology Preview\.app/|com\.apple\.Safari|/WebKit\.framework/|com\.apple\.WebKit",
+        r"^(?:/Applications/Safari\.app/Contents/MacOS/Safari|"
+        r"/Applications/Safari Technology Preview\.app/Contents/MacOS/Safari Technology Preview|"
+        r"/System/Applications/Safari\.app/Contents/MacOS/Safari|"
+        r"/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari\.app/Contents/MacOS/Safari|"
+        r"/System/Volumes/Preboot/Cryptexes/App/System/Library/StagedFrameworks/Safari/.*/com\.apple\.WebKit\.(?:WebContent|GPU|Networking)|"
+        r"/System/Library/.*/com\.apple\.WebKit\.(?:WebContent|GPU|Networking))(?:\s|$)",
         str(command or ""),
     ))
 
@@ -392,7 +415,7 @@ def collect_power_status():
 
     percent_match = re.search(r"(\d+)%", output)
     percent = int(percent_match.group(1)) if percent_match else None
-    charging = "charging" in lower_output or source == "power"
+    charging = bool(re.search(r";\s*charging(?:;|$)", lower_output)) or source == "power"
 
     if source == "battery" and percent is not None:
         label = f"Питание: батарея {percent}% — усыпление быстрее"
@@ -446,6 +469,7 @@ def sleep_current_safari_tab():
         return {"ok": False, "reason": "sleep-script-missing"}
 
     active_tab = collect_active_safari_tab()
+    token = secrets.token_urlsafe(18)
     try:
         result = subprocess.run(
             [
@@ -453,6 +477,7 @@ def sleep_current_safari_tab():
                 SLEEP_CURRENT_SCRIPT,
                 f"http://{HOST}:{PORT}/sleep",
                 ALLOWLIST_PATH,
+                token,
             ],
             check=False,
             capture_output=True,
@@ -472,7 +497,7 @@ def sleep_current_safari_tab():
         response = {"ok": True, "sleptCount": slept_count}
         if active_tab.get("ok"):
             entry, _ = archive_entry({
-                "token": secrets.token_urlsafe(18),
+                "token": token,
                 "url": active_tab.get("url"),
                 "title": active_tab.get("title"),
                 "sleptAt": int(time.time() * 1000),
@@ -578,9 +603,12 @@ def pair_extension_origin(origin):
 
     with TRUSTED_ORIGIN_LOCK:
         trusted_origin = read_trusted_extension_origin()
-        if trusted_origin:
-            return hmac.compare_digest(candidate, trusted_origin)
+        if trusted_origin and hmac.compare_digest(candidate, trusted_origin):
+            return True
 
+        # Safari can rotate a WebExtension's internal UUID after an app update.
+        # The bearer token remains the authentication boundary, so remember the
+        # latest valid extension origin instead of breaking the new popup/worker.
         origin_dir = os.path.dirname(TRUSTED_ORIGIN_PATH)
         if origin_dir:
             os.makedirs(origin_dir, exist_ok=True)
@@ -636,17 +664,71 @@ def read_allowlist():
             return []
 
 
+def read_companion_settings():
+    with SETTINGS_LOCK:
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            if not isinstance(data, dict):
+                raise ValueError("invalid-settings")
+        except Exception:
+            data = {}
+        return {
+            "allowlist": sanitize_domain_patterns(data.get("allowlist", read_allowlist())),
+            "pressureDomains": sanitize_domain_patterns(data.get("pressureDomains", [])),
+        }
+
+
 def save_companion_settings(settings):
-    allowlist = sanitize_domain_patterns(settings.get("allowlist") if isinstance(settings, dict) else [])
+    if not isinstance(settings, dict) or not isinstance(settings.get("allowlist"), list):
+        raise ValueError("invalid-settings-schema")
+    if "pressureDomains" in settings and not isinstance(settings.get("pressureDomains"), list):
+        raise ValueError("invalid-settings-schema")
+    allowlist = sanitize_domain_patterns(settings["allowlist"])
+    pressure_domains = sanitize_domain_patterns(settings.get("pressureDomains", []))
     with SETTINGS_LOCK:
         if read_allowlist() != allowlist:
             write_allowlist(allowlist)
+        settings_dir = os.path.dirname(SETTINGS_PATH)
+        if settings_dir:
+            os.makedirs(settings_dir, exist_ok=True)
+        temp_path = f"{SETTINGS_PATH}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as file:
+            json.dump({"allowlist": allowlist, "pressureDomains": pressure_domains}, file, ensure_ascii=False, indent=2)
+        os.replace(temp_path, SETTINGS_PATH)
         write_settings_ready()
     return {
         "ok": True,
         "ready": True,
         "allowlist": allowlist,
+        "pressureDomains": pressure_domains,
     }
+
+
+def queue_cleanup_request(body):
+    global PENDING_CLEANUP_REQUEST
+    with CLEANUP_REQUEST_LOCK:
+        action = str(body.get("action") or "queue")
+        if action == "ack":
+            request_id = str(body.get("requestId") or "")
+            if PENDING_CLEANUP_REQUEST and hmac.compare_digest(request_id, PENDING_CLEANUP_REQUEST["requestId"]):
+                PENDING_CLEANUP_REQUEST = None
+            return {"ok": True, "pending": PENDING_CLEANUP_REQUEST is not None}
+        request_id = secrets.token_urlsafe(18)
+        PENDING_CLEANUP_REQUEST = {
+            "requestId": request_id,
+            "requestedAt": int(time.time() * 1000),
+            "totalMb": max(0, int(float(body.get("totalMb") or 0))),
+            "maxMb": max(0, int(float(body.get("maxMb") or 0))),
+        }
+        return {"ok": True, "queued": True, **PENDING_CLEANUP_REQUEST}
+
+
+def read_cleanup_request():
+    with CLEANUP_REQUEST_LOCK:
+        if not PENDING_CLEANUP_REQUEST:
+            return {"ok": True, "pending": False}
+        return {"ok": True, "pending": True, **PENDING_CLEANUP_REQUEST}
 
 
 def is_known_sleep_wrapper(parsed):
@@ -707,12 +789,17 @@ def sanitize_archive_entry(entry):
     if not restorable_url or not token:
         return None
 
+    try:
+        slept_at = max(0, int(float(entry.get("sleptAt") or 0)))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
     return {
         "token": token,
         "url": restorable_url,
         "title": str(entry.get("title") or restorable_url),
         "favIconUrl": str(entry.get("favIconUrl") or ""),
-        "sleptAt": int(float(entry.get("sleptAt") or 0)),
+        "sleptAt": slept_at,
         "reason": str(entry.get("reason") or "inactive-timeout"),
         "autoRestore": entry.get("autoRestore") is not False,
     }
@@ -780,7 +867,7 @@ def archive_entry(entry):
 
 def find_archived_entry(token):
     with ARCHIVE_LOCK:
-        entries = save_archive_entries(load_archive_entries())
+        entries = compact_archive_entries(load_archive_entries())
         for entry in entries:
             if entry.get("token") == token:
                 return entry, entries
@@ -788,6 +875,10 @@ def find_archived_entry(token):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def has_valid_host(self):
+        host = str(self.headers.get("Host") or "").strip().lower()
+        return host in (f"127.0.0.1:{PORT}", f"localhost:{PORT}")
+
     def request_origin(self):
         return str(self.headers.get("Origin") or "").strip()
 
@@ -795,12 +886,14 @@ class Handler(BaseHTTPRequestHandler):
         candidate = self.request_origin() if origin is None else str(origin or "").strip()
         return bool(normalize_extension_origin(candidate))
 
-    def is_authorized_mutation(self):
+    def is_authorized_request(self):
         supplied_token = str(self.headers.get(MUTATION_HEADER) or "")
         if not MUTATION_TOKEN or not hmac.compare_digest(supplied_token, MUTATION_TOKEN):
             return False
         origin = self.request_origin()
-        return not origin or pair_extension_origin(origin)
+        if origin:
+            return pair_extension_origin(origin)
+        return hmac.compare_digest(str(self.headers.get(NATIVE_HEADER) or ""), "1")
 
     def send_cors_headers(self):
         origin = self.request_origin()
@@ -822,9 +915,15 @@ class Handler(BaseHTTPRequestHandler):
         return body
 
     def do_GET(self):
+        if not self.has_valid_host():
+            self.send_json(421, {"ok": False, "reason": "invalid-host"})
+            return
         path = urlparse(self.path).path
         if path == "/health":
             self.send_text(200, "ok\n", "text/plain; charset=utf-8")
+            return
+        if path in ("/memory", "/power", "/active-tab", "/settings", "/cleanup-request") and not self.is_authorized_request():
+            self.send_json(403, {"ok": False, "reason": "unauthorized-request"})
             return
         if path == "/memory":
             self.send_json(200, collect_memory_status())
@@ -839,7 +938,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, collect_extension_state())
             return
         if path == "/settings":
-            self.send_json(200, {"ok": True, "ready": settings_ready(), "allowlist": read_allowlist()})
+            self.send_json(200, {"ok": True, "ready": settings_ready(), **read_companion_settings()})
+            return
+        if path == "/cleanup-request":
+            self.send_json(200, read_cleanup_request())
             return
         if path == "/archive-entry":
             query = parse_qs(urlparse(self.path).query)
@@ -861,7 +963,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_text(404, "not found\n", "text/plain; charset=utf-8")
 
     def do_POST(self):
-        if not self.is_authorized_mutation():
+        if not self.has_valid_host():
+            self.send_json(421, {"ok": False, "reason": "invalid-host"})
+            return
+        if not self.is_authorized_request():
             self.send_json(403, {"ok": False, "reason": "unauthorized-mutation"})
             return
 
@@ -880,6 +985,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/settings":
             try:
                 self.send_json(200, save_companion_settings(body))
+            except ValueError as error:
+                self.send_json(400, {"ok": False, "reason": str(error) or "invalid-settings-schema"})
             except Exception:
                 self.send_json(500, {"ok": False, "reason": "settings-write-failed"})
             return
@@ -891,6 +998,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/heartbeat":
             self.send_json(200, mark_extension_heartbeat())
+            return
+
+        if path == "/cleanup-request":
+            try:
+                self.send_json(200, queue_cleanup_request(body))
+            except (TypeError, ValueError, OverflowError):
+                self.send_json(400, {"ok": False, "reason": "invalid-cleanup-request"})
             return
 
         if path != "/archive-entry":
@@ -907,6 +1021,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(500, {"ok": False, "reason": "archive-write-failed"})
 
     def do_OPTIONS(self):
+        if not self.has_valid_host():
+            self.send_response(421)
+            self.end_headers()
+            return
         if not self.is_extension_origin():
             self.send_response(403)
             self.end_headers()
@@ -914,7 +1032,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_cors_headers()
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", f"content-type, {MUTATION_HEADER.lower()}")
+        self.send_header("Access-Control-Allow-Headers", f"content-type, {MUTATION_HEADER.lower()}, {NATIVE_HEADER.lower()}")
         self.end_headers()
 
     def send_text(self, status, body, content_type):
@@ -950,6 +1068,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    lock_path = f"/tmp/safari-tab-sleeper-{os.getuid()}-{PORT}.lock"
+    server_lock = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(server_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(0)
     save_archive_entries(load_archive_entries())
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Safari Tab Sleeper server listening on http://{HOST}:{PORT}/sleep", flush=True)

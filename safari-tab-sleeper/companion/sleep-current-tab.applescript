@@ -83,8 +83,12 @@ end isAllowlistedURL
 on isLocalSleeperURL(tabURL)
 	set lowerURL to my lowerText(tabURL)
 	if lowerURL starts with "file:" and lowerURL contains "local-sleeper.html" then return true
-	if lowerURL starts with "http://127.0.0.1:17654/sleep" then return true
-	if lowerURL starts with "http://localhost:17654/sleep" then return true
+	try
+		set urlObject to current application's |NSURL|'s URLWithString:(tabURL as text)
+		set hostText to my lowerText((urlObject's |host|()) as text)
+		set pathText to (urlObject's |path|()) as text
+		if (hostText is "127.0.0.1" or hostText is "localhost") and pathText is "/sleep" then return true
+	end try
 	if lowerURL starts with "safari-web-extension:" and lowerURL contains "/sleep/sleep.html" then return true
 	if lowerURL starts with "safari-extension:" and lowerURL contains "/sleep/sleep.html" then return true
 	return false
@@ -95,6 +99,9 @@ on run argv
 	set sleeperTarget to item 1 of argv
 	set allowlistPath to ""
 	if (count of argv) is greater than 1 then set allowlistPath to item 2 of argv
+	set entryToken to ""
+	if (count of argv) is greater than 2 then set entryToken to item 3 of argv
+	if entryToken is "" then error "Не передан токен сна."
 	
 	tell application "Safari"
 		if it is not running then error "Safari не запущен."
@@ -110,7 +117,7 @@ on run argv
 		end try
 	end tell
 	
-set sleeperURL to (my sleepPageBaseURL(sleeperTarget)) & "#url=" & (my encodeQueryComponent(originalURL)) & "&title=" & (my encodeQueryComponent(originalTitle)) & "&reason=manual-current-tab&auto=0"
+set sleeperURL to (my sleepPageBaseURL(sleeperTarget)) & "#token=" & (my encodeQueryComponent(entryToken))
 	
 	tell application "Safari"
 		set URL of current tab of front window to sleeperURL

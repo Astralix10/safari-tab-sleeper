@@ -4,6 +4,7 @@
   let youtubeVideoCount = 0;
   let youtubeLastVideoUrl = '';
   let lastHref = location.href;
+  const fieldSnapshots = new WeakMap();
 
   function isEditableElement(target) {
     if (!target) {
@@ -14,26 +15,64 @@
     return target.isContentEditable || tagName === 'textarea' || tagName === 'select' || tagName === 'input';
   }
 
-  function isYouTubeWatchUrl(url) {
+  function youtubeVideoIdentity(url) {
     try {
       const parsed = new URL(url);
       const host = parsed.hostname.toLowerCase();
-      return (host === 'youtube.com' || host.endsWith('.youtube.com')) && parsed.pathname === '/watch' && parsed.searchParams.has('v');
+      if (host === 'youtu.be') {
+        return parsed.pathname.split('/').filter(Boolean)[0] || '';
+      }
+      if (host !== 'youtube.com' && !host.endsWith('.youtube.com')) {
+        return '';
+      }
+      if (parsed.pathname === '/watch') {
+        return parsed.searchParams.get('v') || '';
+      }
+      const shortMatch = parsed.pathname.match(/^\/(?:shorts|live)\/([^/]+)/);
+      return shortMatch?.[1] || '';
     } catch {
-      return false;
+      return '';
     }
+  }
+
+  function fieldValue(field) {
+    if (field instanceof HTMLInputElement && (field.type === 'checkbox' || field.type === 'radio')) {
+      return `${field.checked}`;
+    }
+    if (field instanceof HTMLSelectElement) {
+      return Array.from(field.selectedOptions, (option) => option.value).join('\u0000');
+    }
+    return String(field.value ?? field.textContent ?? '');
+  }
+
+  function rememberFields(root = document) {
+    for (const field of root.querySelectorAll?.('input, textarea, select, [contenteditable="true"]') ?? []) {
+      if (!fieldSnapshots.has(field)) {
+        fieldSnapshots.set(field, fieldValue(field));
+      }
+    }
+  }
+
+  function hasProgrammaticFieldChanges() {
+    rememberFields();
+    for (const field of document.querySelectorAll('input, textarea, select, [contenteditable="true"]')) {
+      if (fieldSnapshots.get(field) !== fieldValue(field)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function sendState() {
     try {
-      api.runtime.sendMessage({
+      Promise.resolve(api.runtime.sendMessage({
         type: 'tab-sleeper:page-state',
         pageUrl: location.href,
         pageTitle: document.title,
         dirty,
         youtubeVideoCount,
         youtubeLastVideoUrl,
-      });
+      })).catch(() => undefined);
     } catch {
       // The background worker may be asleep or unavailable.
     }
@@ -46,10 +85,10 @@
     }
 
     lastHref = href;
-    dirty = false;
-    if (isYouTubeWatchUrl(href) && href !== youtubeLastVideoUrl) {
+    const videoIdentity = youtubeVideoIdentity(href);
+    if (videoIdentity && videoIdentity !== youtubeLastVideoUrl) {
       youtubeVideoCount += 1;
-      youtubeLastVideoUrl = href;
+      youtubeLastVideoUrl = videoIdentity;
     }
     sendState();
   }
@@ -69,13 +108,17 @@
   }, true);
 
   document.addEventListener('submit', () => {
-    dirty = false;
+    dirty = true;
     sendState();
   }, true);
 
-  window.addEventListener('pageshow', sendState);
+  window.addEventListener('pageshow', () => {
+    rememberFields();
+    sendState();
+  });
   window.addEventListener('popstate', () => setTimeout(handleNavigationChange, 0));
-  window.setInterval(handleNavigationChange, 1000);
+  window.addEventListener('hashchange', handleNavigationChange);
+  document.addEventListener('yt-navigate-finish', handleNavigationChange);
 
   for (const method of ['pushState', 'replaceState']) {
     const original = history[method];
@@ -95,6 +138,7 @@
     }
 
     if (message?.type === 'tab-sleeper:can-sleep') {
+      dirty ||= hasProgrammaticFieldChanges();
       return Promise.resolve({
         canSleep: !dirty,
         dirty,
@@ -107,7 +151,7 @@
 
     if (message?.type === 'tab-sleeper:reset-youtube-counter') {
       youtubeVideoCount = 0;
-      youtubeLastVideoUrl = isYouTubeWatchUrl(location.href) ? location.href : '';
+      youtubeLastVideoUrl = youtubeVideoIdentity(location.href);
       sendState();
       return Promise.resolve({ ok: true });
     }
@@ -115,9 +159,10 @@
     return false;
   });
 
-  if (isYouTubeWatchUrl(location.href)) {
+  rememberFields();
+  if (youtubeVideoIdentity(location.href)) {
     youtubeVideoCount = 1;
-    youtubeLastVideoUrl = location.href;
+    youtubeLastVideoUrl = youtubeVideoIdentity(location.href);
   }
   sendState();
 })();

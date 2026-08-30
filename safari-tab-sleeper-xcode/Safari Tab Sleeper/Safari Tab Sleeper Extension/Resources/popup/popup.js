@@ -61,7 +61,9 @@ async function readActiveTabHint(fallbackState = currentState) {
       let matchingTab = null;
       try {
         const tabs = await api.tabs.query({});
-        matchingTab = tabs.find((candidate) => candidate.url === companionTab.url) ?? null;
+        const matchingTabs = tabs.filter((candidate) => candidate.url === companionTab.url);
+        matchingTab = matchingTabs.find((candidate) => candidate.active)
+          || (matchingTabs.length === 1 ? matchingTabs[0] : null);
       } catch {
         // The URL from the front Safari window is still authoritative for the switch.
       }
@@ -153,38 +155,9 @@ function formatMemory(mb) {
   return `${Math.round(value)} МБ`;
 }
 
-function memoryEndpointFromSettings(settings = {}) {
-  return companionEndpointFromSettings(settings, '/memory');
-}
-
-function companionEndpointFromSettings(settings = {}, pathname = '/') {
-  try {
-    const url = new URL(settings.sleepServerUrl || 'http://127.0.0.1:17654/sleep');
-    url.pathname = pathname;
-    url.search = '';
-    url.hash = '';
-    return url.toString();
-  } catch {
-    return `http://127.0.0.1:17654${pathname}`;
-  }
-}
-
 async function readCompanionActiveTab(settings = {}) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 1200);
-  try {
-    const response = await fetch(companionEndpointFromSettings(settings, '/active-tab'), {
-      cache: 'no-store',
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      return null;
-    }
-    const result = await response.json();
-    return result?.ok && hostnameFromUrl(result.url) ? result : null;
-  } finally {
-    clearTimeout(timeout);
-  }
+  const result = await send('tab-sleeper:get-companion-active-tab');
+  return result?.ok && hostnameFromUrl(result.url) ? result : null;
 }
 
 async function readStoredSettings(fallback = {}) {
@@ -232,25 +205,24 @@ async function setCurrentSiteAllowlisted(enabled) {
   }
 
   const settings = await readStoredSettings(currentState?.settings);
-  const result = setAllowlistForHost(settings.allowlist ?? [], host, enabled);
-  const nextSettings = mergeSettings({ ...settings, allowlist: result.allowlist });
-  await api.storage.local.set({
-    settings: nextSettings,
-    settingsSchemaVersion: SETTINGS_SCHEMA_VERSION,
-  });
-
   try {
-    await send('tab-sleeper:set-allowlist-current', { ...hint, enabled });
+    const workerResult = await send('tab-sleeper:set-allowlist-current', { ...hint, enabled });
+    if (workerResult?.ok === false) {
+      return workerResult;
+    }
+    const nextSettings = mergeSettings(workerResult?.settings ?? settings);
+    currentState = { ...currentState, settings: nextSettings, currentHost: host };
+    return { ok: true, enabled: workerResult.enabled, domain: host };
   } catch {
-    // Direct storage remains authoritative if Safari is restarting the worker.
+    const result = setAllowlistForHost(settings.allowlist ?? [], host, enabled);
+    if (result.blockedByPattern) {
+      return { ok: false, reason: 'covered-by-allowlist-pattern' };
+    }
+    const nextSettings = mergeSettings({ ...settings, allowlist: result.allowlist });
+    await api.storage.local.set({ settings: nextSettings, settingsSchemaVersion: SETTINGS_SCHEMA_VERSION });
+    currentState = { ...currentState, settings: nextSettings, currentHost: host };
+    return { ok: true, enabled: result.enabled, domain: host };
   }
-
-  currentState = {
-    ...currentState,
-    settings: nextSettings,
-    currentHost: host,
-  };
-  return { ok: true, enabled: result.enabled, domain: host };
 }
 
 async function updateAllowlistToggle(enabled) {
@@ -277,37 +249,11 @@ async function updateAllowlistToggle(enabled) {
 }
 
 async function readMemoryStatus(settings = {}) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 700);
-  try {
-    const response = await fetch(memoryEndpointFromSettings(settings), {
-      cache: 'no-store',
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    return response.json();
-  } finally {
-    clearTimeout(timeout);
-  }
+  return send('tab-sleeper:get-memory-status');
 }
 
 async function readPowerStatus(settings = {}) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 1200);
-  try {
-    const response = await fetch(companionEndpointFromSettings(settings, '/power'), {
-      cache: 'no-store',
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    return response.json();
-  } finally {
-    clearTimeout(timeout);
-  }
+  return send('tab-sleeper:get-power-status');
 }
 
 async function sleepCurrentWithFallback() {
@@ -423,6 +369,9 @@ function formatActionReason(reason) {
     allowlisted: 'для этого сайта включена защита от усыпления',
     'already-sleeping': 'вкладка уже спит',
     'dirty-form': 'на странице есть несохранённые данные',
+    'dirty-state-unavailable': 'не удалось безопасно проверить несохранённые данные',
+    'tab-changed': 'вкладка успела перейти на другую страницу',
+    'covered-by-allowlist-pattern': 'сайт защищён общим шаблоном в настройках',
     'missing-active-tab': 'Safari не передал активную вкладку',
     'sleep-server-unavailable': 'локальный companion недоступен',
     'unsupported-url': 'эту страницу нельзя усыпить',

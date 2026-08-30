@@ -42,8 +42,10 @@ chmod +x "$RUNTIME_DIR/memory-guard.zsh"
 if [[ ! -f "$RUNTIME_DIR/allowlist.txt" ]]; then
   touch "$RUNTIME_DIR/allowlist.txt"
   rm -f "$RUNTIME_DIR/settings-ready"
-  rm -f "$RUNTIME_DIR/trusted-extension-origin.txt"
 fi
+# Safari may assign a new internal WebExtension origin after an app update.
+# The next request must pair that origin again using the unchanged 256-bit token.
+rm -f "$RUNTIME_DIR/trusted-extension-origin.txt"
 
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

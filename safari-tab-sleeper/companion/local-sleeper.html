@@ -107,15 +107,7 @@
     }
 
     function getSleepingTabIconUrl(pageUrl) {
-      try {
-        const parsed = new URL(normalizeRestorableUrl(pageUrl) || pageUrl);
-        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-          return '';
-        }
-        return `${parsed.origin}/favicon.ico`;
-      } catch {
-        return '';
-      }
+      return '';
     }
 
     function decodeURIComponentSafely(value) {

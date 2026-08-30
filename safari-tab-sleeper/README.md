@@ -26,7 +26,7 @@ It targets the annoying case where long-lived tabs, especially YouTube, keep lar
   - reset the YouTube counter
 - Shows Safari/WebKit memory and current power mode in the popup.
 - Uses a local recovery archive for sleeping-tab URLs.
-- Pairs mutating localhost requests to the installed extension origin and requires a private token.
+- Requires a private token for localhost requests and safely follows Safari WebExtension origin rotation after app updates.
 - Automatically compacts duplicate archived URLs so the archive does not grow forever.
 - Rejects nested sleep-page URLs and atomically writes the recovery archive.
 - Serializes tab-state updates so simultaneous Safari events cannot erase counters or restore records.
@@ -148,6 +148,15 @@ npm test
 npm run check:scripts
 npm run build:menubar
 ```
+
+## Release 0.3.9
+
+- Fixes the site protection switch end to end: extension storage is authoritative and every sleep operation rechecks the latest allowlist immediately before unloading.
+- Keeps the popup and companion connected when Safari rotates the WebExtension UUID after an app update.
+- Routes automatic memory-pressure cleanup through the extension eligibility path, so pinned, audible, dirty, active, and protected tabs are skipped consistently.
+- Prevents stale-tab navigation races, duplicate-URL targeting, orphaned archive entries, and stale tab-state growth.
+- Hardens the localhost companion with Host validation, authenticated sensitive endpoints, strict settings validation, exact Safari process matching, and a single-instance lock.
+- Removes original URLs and remote favicon requests from modern sleep links.
 
 ## Release 0.3.8
 

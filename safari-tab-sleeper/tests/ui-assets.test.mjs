@@ -9,7 +9,7 @@ test('sleep page does not default to the extension icon', async () => {
   const html = await read('extension/sleep/sleep.html');
 
   assert.equal(html.includes('../icons/icon-48.svg'), false);
-  assert.equal(html.includes('early-favicon.js'), true);
+  assert.equal(html.includes('early-favicon.js'), false);
 });
 
 test('main extension UI is localized to Russian', async () => {
@@ -55,7 +55,9 @@ test('popup uses one centered allowlist switch instead of fast-sleep shortcut', 
   assert.equal(popupJs.includes('setCurrentSiteAllowlisted'), true);
   assert.equal(popupJs.includes('updateAllowlistToggle'), true);
   assert.equal(popupJs.includes('tab-sleeper:set-allowlist-current'), true);
-  assert.equal(popupJs.includes("'/active-tab'"), true);
+  assert.equal(popupJs.includes("'/active-tab'"), false);
+  assert.equal(background.includes("'/active-tab'"), true);
+  assert.equal(popupJs.includes('tab-sleeper:get-memory-status'), true);
   assert.equal(popupJs.includes('settingsSchemaVersion: SETTINGS_SCHEMA_VERSION'), true);
   assert.equal(popupJs.includes('activeTabHintFromState'), true);
   assert.equal(popupJs.includes("addEventListener('click'"), true);
@@ -83,7 +85,7 @@ test('popup uses one centered allowlist switch instead of fast-sleep shortcut', 
   assert.equal(background.includes('reconcileCompanionSettings'), false);
   assert.equal(background.includes('void syncCompanionSettings(baseSettings)'), false);
   assert.equal(background.includes('companionSettingsSyncQueue'), true);
-  assert.equal(background.includes('await syncCompanionSettings(storedSettings)'), true);
+  assert.equal(background.includes('void syncCompanionSettings(storedSettings)'), true);
   assert.equal(background.includes('companionMutationHeaders()'), true);
   assert.equal(sleeperServer.includes('def collect_active_safari_tab'), true);
   assert.equal(sleeperServer.includes('if path == "/active-tab"'), true);
@@ -144,7 +146,7 @@ test('sleep pages auto-restore when returning to a manually slept background tab
   assert.equal(localSleeper.includes('wasHiddenAfterSleep && restorableUrl'), true);
 });
 
-test('companion AppleScript cleanup respects the extension allowlist', async () => {
+test('memory cleanup is delegated to the protected extension eligibility path', async () => {
   const [background, pageGuard, memoryGuard, installLaunchAgent, installMenuBar, menuBarSwift, sleepCurrentScript, sleepHeavyScript, sleepAllScript] = await Promise.all([
     read('extension/background/service-worker-0.2.9.js'),
     read('extension/content/page-guard.js'),
@@ -162,14 +164,16 @@ test('companion AppleScript cleanup respects the extension allowlist', async () 
   assert.equal(background.includes('storageMutationQueues'), true);
   assert.equal(background.includes('isTabProtectedByLatestSettings'), true);
   assert.equal(background.includes("return { ok: false, reason: 'allowlisted' };"), true);
-  assert.equal(background.includes("debugActiveTab('hinted-url-match'"), true);
+  assert.equal(background.includes("debugActiveTab('hinted-url-unique-match'"), true);
   assert.equal(background.includes('sleep-navigation-failed'), true);
-  assert.equal(pageGuard.includes('dirty = false;'), true);
-  assert.equal(memoryGuard.includes('allowlist.txt'), true);
+  assert.equal(pageGuard.includes('window.setInterval(handleNavigationChange, 1000)'), false);
+  assert.equal(memoryGuard.includes('/cleanup-request'), true);
+  assert.equal(memoryGuard.includes('osascript "$SCRIPT_DIR/sleep-inactive-youtube-tabs.applescript"'), false);
   assert.equal(memoryGuard.includes('http://127.0.0.1:17654/sleep'), true);
   assert.equal(installLaunchAgent.includes('settings-ready'), true);
   assert.equal(installLaunchAgent.includes('if [[ ! -f "$RUNTIME_DIR/allowlist.txt" ]]; then'), true);
   assert.equal(installLaunchAgent.includes('rm -f "$RUNTIME_DIR/settings-ready"'), true);
+  assert.equal(installLaunchAgent.includes('rm -f "$RUNTIME_DIR/trusted-extension-origin.txt"'), true);
   assert.equal(installLaunchAgent.includes('pkill -f "$RUNTIME_DIR/sleeper-server.py"'), true);
   assert.equal(installMenuBar.includes('allowlist.txt'), true);
   assert.equal(menuBarSwift.includes('sleepServerURL'), true);
@@ -178,16 +182,8 @@ test('companion AppleScript cleanup respects the extension allowlist', async () 
   assert.equal(sleepCurrentScript.includes('isAllowlistedURL'), true);
   assert.equal(sleepCurrentScript.includes('reason=allowlisted'), true);
   assert.equal(sleepCurrentScript.includes('reason=already-sleeping'), true);
-  assert.equal(sleepHeavyScript.includes('isAllowlistedURL'), true);
-  assert.equal(sleepHeavyScript.includes('127.0.0.1:17654/sleep'), true);
-  assert.equal(sleepHeavyScript.includes('/sleep/sleep.html'), true);
-  assert.equal(sleepHeavyScript.includes('allowlistPath'), true);
-  assert.equal(sleepHeavyScript.includes('not my isAllowlistedURL(originalURL, allowlistPath)'), true);
-  assert.equal(sleepHeavyScript.includes('hostText ends with ("." & domainText)'), true);
-  assert.equal(sleepAllScript.includes('isAllowlistedURL'), true);
-  assert.equal(sleepAllScript.includes('127.0.0.1:17654/sleep'), true);
-  assert.equal(sleepAllScript.includes('/sleep/sleep.html'), true);
-  assert.equal(sleepAllScript.includes('not my isAllowlistedURL(originalURL, allowlistPath)'), true);
+  assert.equal(sleepHeavyScript.includes('reason=extension-required'), true);
+  assert.equal(sleepAllScript.includes('reason=extension-required'), true);
 });
 
 test('popup trusts the front Safari tab over stale extension state', async () => {
