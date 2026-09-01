@@ -61,6 +61,34 @@ let lastActiveTabId = null;
 let lastActiveWindowId = null;
 let activeTabDebug = { source: 'not-queried' };
 
+function domainKeyFromUrl(url) {
+  const host = hostnameFromUrl(url);
+  if (!host) {
+    return '';
+  }
+  return isYouTubeUrl(url) ? 'youtube.com' : host.replace(/^www\./, '');
+}
+
+function countTabsByDomain(tabs) {
+  const counts = new Map();
+  for (const tab of tabs) {
+    const key = domainKeyFromUrl(tab?.url);
+    if (key) {
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+async function countSameDomainTabs(tab) {
+  const key = domainKeyFromUrl(tab?.url);
+  if (!key) {
+    return 1;
+  }
+  const counts = countTabsByDomain(await api.tabs.query({}));
+  return Math.max(1, counts.get(key) ?? 1);
+}
+
 function rememberActiveTab(tabId, windowId = null) {
   if (tabId == null) {
     return;
@@ -198,6 +226,7 @@ async function ensureTabState(tab, knownState = null) {
       createdAt: now,
       lastActiveAt: now,
       dirty: false,
+      mediaPlaying: false,
       youtubeVideoCount: 0,
       ...current,
       title: tab.title,
@@ -211,64 +240,76 @@ async function ensureTabState(tab, knownState = null) {
 }
 
 async function askPageCanSleep(tab, settings, state) {
-  if (!settings.protectDirtyForms) {
-    return { canSleep: true };
-  }
-
+  let response = null;
   try {
-    const response = await api.tabs.sendMessage(tab.id, { type: 'tab-sleeper:can-sleep' });
-    if (response && typeof response === 'object') {
-      const youtubeState = mergeYouTubePageState(state, response);
-      await patchTabState(tab.id, {
-        dirty: Boolean(response.dirty),
-        pageUrl: response.pageUrl,
-        pageTitle: response.pageTitle,
-        ...youtubeState,
-      });
-      return {
-        canSleep: response.canSleep !== false,
-        dirty: Boolean(response.dirty),
-      };
-    }
+    response = await api.tabs.sendMessage(tab.id, { type: 'tab-sleeper:can-sleep' });
   } catch {
-    if (api.scripting?.executeScript) {
-      try {
-        const results = await api.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: () => {
-            const fields = document.querySelectorAll('input, textarea, select, [contenteditable="true"]');
-            const dirty = Array.from(fields).some((field) => {
-              if (field instanceof HTMLInputElement && (field.type === 'checkbox' || field.type === 'radio')) {
-                return field.checked !== field.defaultChecked;
-              }
-              if (field instanceof HTMLSelectElement) {
-                return Array.from(field.options).some((option) => option.selected !== option.defaultSelected);
-              }
-              if (field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) {
-                return field.value !== field.defaultValue;
-              }
-              return Boolean(field.textContent?.trim());
-            });
-            return { canSleep: !dirty, dirty, pageUrl: location.href, pageTitle: document.title };
-          },
-        });
-        const response = results?.[0]?.result;
-        if (response && typeof response === 'object') {
-          await patchTabState(tab.id, {
-            dirty: Boolean(response.dirty),
-            pageUrl: response.pageUrl,
-            pageTitle: response.pageTitle,
-          });
-          return { canSleep: response.canSleep !== false, dirty: Boolean(response.dirty), injectedGuard: true };
-        }
-      } catch {
-        // Restricted pages are skipped while dirty-form protection is enabled.
-      }
-    }
-    return { canSleep: false, reason: 'dirty-state-unavailable', missingContentScript: true };
+    // Older Safari tabs may have no content-script receiver yet.
   }
 
-  return { canSleep: false, reason: 'dirty-state-unavailable' };
+  if (response && typeof response === 'object') {
+    const youtubeState = mergeYouTubePageState(state, response);
+    await patchTabState(tab.id, {
+      dirty: Boolean(response.dirty),
+      mediaPlaying: Boolean(response.mediaPlaying),
+      pageUrl: response.pageUrl,
+      pageTitle: response.pageTitle,
+      ...youtubeState,
+    });
+    return {
+      canSleep: settings.protectDirtyForms ? response.canSleep !== false : true,
+      dirty: Boolean(response.dirty),
+      mediaPlaying: Boolean(response.mediaPlaying),
+    };
+  }
+
+  if (api.scripting?.executeScript) {
+    try {
+      const results = await api.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => {
+          const fields = document.querySelectorAll('input, textarea, select, [contenteditable="true"]');
+          const dirty = Array.from(fields).some((field) => {
+            if (field instanceof HTMLInputElement && (field.type === 'checkbox' || field.type === 'radio')) {
+              return field.checked !== field.defaultChecked;
+            }
+            if (field instanceof HTMLSelectElement) {
+              return Array.from(field.options).some((option) => option.selected !== option.defaultSelected);
+            }
+            if (field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) {
+              return field.value !== field.defaultValue;
+            }
+            return Boolean(field.textContent?.trim());
+          });
+          const mediaPlaying = Array.from(document.querySelectorAll('audio, video'))
+            .some((media) => !media.paused && !media.ended && media.readyState > 0);
+          return { canSleep: !dirty, dirty, mediaPlaying, pageUrl: location.href, pageTitle: document.title };
+        },
+      });
+      response = results?.[0]?.result;
+      if (response && typeof response === 'object') {
+        await patchTabState(tab.id, {
+          dirty: Boolean(response.dirty),
+          mediaPlaying: Boolean(response.mediaPlaying),
+          pageUrl: response.pageUrl,
+          pageTitle: response.pageTitle,
+        });
+        return {
+          canSleep: settings.protectDirtyForms ? response.canSleep !== false : true,
+          dirty: Boolean(response.dirty),
+          mediaPlaying: Boolean(response.mediaPlaying),
+          injectedGuard: true,
+        };
+      }
+    } catch {
+      // Restricted pages are handled conservatively below.
+    }
+  }
+
+  if (!settings.protectDirtyForms) {
+    return { canSleep: true, dirty: false, mediaPlaying: Boolean(tab.audible), missingContentScript: true };
+  }
+  return { canSleep: false, reason: 'dirty-state-unavailable', mediaPlaying: Boolean(tab.audible), missingContentScript: true };
 }
 
 async function notifyOnce(id, title, message) {
@@ -687,9 +728,28 @@ async function performSleepTab(tab, reason, options = {}) {
   }
 
   const immediate = Boolean(options.immediate);
+  const stateForDecision = {
+    ...state,
+    dirty: guard.dirty,
+    mediaPlaying: guard.mediaPlaying,
+  };
+  const sameDomainTabCount = options.manual ? 1 : await countSameDomainTabs(tab);
+  if (
+    !options.manual
+    && Boolean(tab.audible || stateForDecision.mediaPlaying)
+    && sameDomainTabCount === 1
+  ) {
+    return { ok: false, reason: 'single-media-tab' };
+  }
   const decision = options.manual || immediate
-    ? buildManualSleepDecision({ tab, state: { ...state, dirty: guard.dirty }, settings, runtimeBaseUrl: RUNTIME_BASE_URL })
-    : buildSleepDecision({ tab, state: { ...state, dirty: guard.dirty }, settings, runtimeBaseUrl: RUNTIME_BASE_URL });
+    ? buildManualSleepDecision({ tab, state: stateForDecision, settings, runtimeBaseUrl: RUNTIME_BASE_URL })
+    : buildSleepDecision({
+      tab,
+      state: stateForDecision,
+      settings,
+      runtimeBaseUrl: RUNTIME_BASE_URL,
+      sameDomainTabCount,
+    });
 
   if (options.manual || immediate ? !decision.eligible : !decision.sleep) {
     return { ok: false, reason: decision.reason };
@@ -893,6 +953,7 @@ async function performTabScan() {
     readObject(STORAGE_KEYS.tabStates),
   ]);
   const activeTabs = tabs.filter((tab) => tab.active && tab.id != null);
+  const domainTabCounts = countTabsByDomain(tabs);
   const openTabIds = new Set(tabs.filter((tab) => tab.id != null).map((tab) => String(tab.id)));
   await mutateObject(STORAGE_KEYS.tabStates, (states) => {
     for (const tabId of Object.keys(states)) {
@@ -934,6 +995,7 @@ async function performTabScan() {
         settings,
         now: Date.now(),
         runtimeBaseUrl: RUNTIME_BASE_URL,
+        sameDomainTabCount: domainTabCounts.get(domainKeyFromUrl(tab.url)) ?? 1,
       });
 
       if (decision.sleep) {
@@ -1261,6 +1323,7 @@ api.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       title: tab.title,
       url: tab.url,
       favIconUrl: tab.favIconUrl,
+      mediaPlaying: changeInfo.url ? false : undefined,
       lastActiveAt: tab.active ? Date.now() : undefined,
     });
   }
@@ -1281,6 +1344,7 @@ async function handleRuntimeMessage(message, sender) {
     const youtubeState = mergeYouTubePageState(existingState, message);
     await patchTabState(tabId, {
       dirty: Boolean(message.dirty),
+      mediaPlaying: Boolean(message.mediaPlaying),
       pageUrl: message.pageUrl,
       pageTitle: message.pageTitle,
       ...youtubeState,

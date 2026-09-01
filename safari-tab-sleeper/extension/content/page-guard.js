@@ -63,6 +63,11 @@
     return false;
   }
 
+  function mediaIsPlaying() {
+    return Array.from(document.querySelectorAll('audio, video'))
+      .some((media) => !media.paused && !media.ended && media.readyState > 0);
+  }
+
   function sendState() {
     try {
       Promise.resolve(api.runtime.sendMessage({
@@ -70,6 +75,7 @@
         pageUrl: location.href,
         pageTitle: document.title,
         dirty,
+        mediaPlaying: mediaIsPlaying(),
         youtubeVideoCount,
         youtubeLastVideoUrl,
       })).catch(() => undefined);
@@ -112,6 +118,11 @@
     sendState();
   }, true);
 
+  for (const eventName of ['play', 'playing', 'pause', 'ended', 'emptied']) {
+    document.addEventListener(eventName, sendState, true);
+  }
+  document.addEventListener('visibilitychange', sendState, true);
+
   window.addEventListener('pageshow', () => {
     rememberFields();
     sendState();
@@ -142,6 +153,7 @@
       return Promise.resolve({
         canSleep: !dirty,
         dirty,
+        mediaPlaying: mediaIsPlaying(),
         pageUrl: location.href,
         pageTitle: document.title,
         youtubeVideoCount,

@@ -8,7 +8,7 @@ It targets the annoying case where long-lived tabs, especially YouTube, keep lar
 
 - Sleeps inactive tabs after a configurable timeout.
 - Uses Safe, Balanced, and Aggressive profiles.
-- Applies power-aware timing: faster cleanup on battery, softer cleanup on power.
+- Keeps the selected inactivity timer stable while tuning only heavy-tab cleanup for battery or power.
 - Restores sleeping tabs automatically when selected.
 - Retries restore for active sleep pages that get stuck.
 - Keeps the original tab title and favicon visible with `[sleep]` prefixes.
@@ -148,6 +148,13 @@ npm test
 npm run check:scripts
 npm run build:menubar
 ```
+
+## Release 0.3.10
+
+- Makes the aggressive profile sleep ordinary inactive tabs after exactly five minutes, including while the Mac is charging.
+- Detects playing audio and video in the page, including muted video, and protects the only media tab for a domain.
+- Lets aggressive cleanup unload an inactive media tab only when another tab for the same domain is open.
+- Runs the injected page-state fallback when old Safari tabs return no content-script response instead of an error.
 
 ## Release 0.3.9
 

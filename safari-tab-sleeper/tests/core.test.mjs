@@ -188,26 +188,88 @@ test('profiles tune sleep timing and media behavior', () => {
   });
   assert.deepEqual(applyProfile('aggressive'), {
     profile: 'aggressive',
-    inactivityMinutes: 1,
+    inactivityMinutes: 5,
     youtubeHighRiskInactiveSeconds: 20,
     skipAudible: false,
   });
 });
 
-test('power-aware mode sleeps faster on battery and softer on power', () => {
+test('power-aware mode never changes the configured inactivity timer', () => {
   const balanced = mergeSettings({ profile: 'balanced' });
   const battery = applyPowerMode(balanced, { source: 'battery', ok: true });
   const power = applyPowerMode(balanced, { source: 'power', ok: true });
   const disabled = applyPowerMode({ ...balanced, powerAware: false }, { source: 'battery', ok: true });
 
   assert.equal(battery.powerMode, 'battery');
-  assert.equal(battery.inactivityMinutes, 3);
+  assert.equal(battery.inactivityMinutes, 5);
   assert.equal(battery.youtubeHighRiskInactiveSeconds, 45);
   assert.equal(power.powerMode, 'power');
-  assert.equal(power.inactivityMinutes, 10);
+  assert.equal(power.inactivityMinutes, 5);
   assert.equal(power.youtubeHighRiskInactiveSeconds, 120);
   assert.equal(disabled.inactivityMinutes, balanced.inactivityMinutes);
   assert.equal(disabled.powerMode, 'default');
+});
+
+test('aggressive profile sleeps normal tabs at five minutes, including on power', () => {
+  const now = 1_000_000;
+  const settings = applyPowerMode(mergeSettings({
+    profile: 'aggressive',
+    inactivityMinutes: 1,
+  }), { source: 'power', ok: true });
+  const tab = {
+    id: 19,
+    active: false,
+    audible: false,
+    pinned: false,
+    url: 'https://example.com/report',
+  };
+
+  assert.equal(settings.inactivityMinutes, 5);
+  assert.deepEqual(buildSleepDecision({
+    tab,
+    state: { lastActiveAt: now - 299_999, dirty: false },
+    settings,
+    now,
+  }), { sleep: false, reason: 'not-idle-long-enough' });
+  assert.deepEqual(buildSleepDecision({
+    tab,
+    state: { lastActiveAt: now - 300_000, dirty: false },
+    settings,
+    now,
+  }), { sleep: true, reason: 'inactive-timeout' });
+});
+
+test('aggressive profile protects the only playing media tab for a domain', () => {
+  const now = 1_000_000;
+  const settings = mergeSettings({ profile: 'aggressive' });
+  const tab = {
+    id: 20,
+    active: false,
+    audible: false,
+    pinned: false,
+    url: 'https://video.example/watch/1',
+  };
+  const state = {
+    lastActiveAt: now - 300_000,
+    dirty: false,
+    mediaPlaying: true,
+  };
+
+  assert.deepEqual(buildSleepDecision({ tab, state, settings, now, sameDomainTabCount: 1 }), {
+    sleep: false,
+    reason: 'single-media-tab',
+  });
+  assert.deepEqual(buildSleepDecision({ tab, state, settings, now, sameDomainTabCount: 2 }), {
+    sleep: true,
+    reason: 'inactive-timeout',
+  });
+  assert.deepEqual(buildSleepDecision({
+    tab: { ...tab, audible: true },
+    state: { ...state, mediaPlaying: false },
+    settings,
+    now,
+    sameDomainTabCount: 1,
+  }), { sleep: false, reason: 'single-media-tab' });
 });
 
 test('stuck active sleep tabs are eligible for a retry healer', () => {

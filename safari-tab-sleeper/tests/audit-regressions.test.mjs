@@ -61,6 +61,9 @@ test('worker resolves explicit tab IDs first and commits archive after navigatio
   assert.equal(sleepBody.indexOf('await api.tabs.update') < sleepBody.lastIndexOf('await archiveSleepEntry'), true);
   assert.equal(worker.includes("reason: 'dirty-state-unavailable'"), true);
   assert.equal(worker.includes('delete states[tabId]'), true);
+  assert.equal(worker.includes('countTabsByDomain(tabs)'), true);
+  assert.equal(worker.includes('sameDomainTabCount'), true);
+  assert.equal(worker.includes('mediaPlaying: guard.mediaPlaying'), true);
 });
 
 test('page guard keeps dirty state across SPA navigation and has no one-second poll', async () => {
@@ -70,6 +73,8 @@ test('page guard keeps dirty state across SPA navigation and has no one-second p
   assert.equal(guard.includes('dirty = false;\n    if'), false);
   assert.equal(guard.includes("document.addEventListener('submit', () => {\n    dirty = true;"), true);
   assert.equal(guard.includes('Promise.resolve(api.runtime.sendMessage'), true);
+  assert.equal(guard.includes('mediaPlaying: mediaIsPlaying()'), true);
+  assert.equal(guard.includes("['play', 'playing', 'pause', 'ended', 'emptied']"), true);
 });
 
 test('companion enforces host/auth/schema and delegates automatic cleanup', async () => {

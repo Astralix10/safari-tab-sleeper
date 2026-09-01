@@ -57,7 +57,7 @@ const PROFILE_SETTINGS = Object.freeze({
   }),
   aggressive: Object.freeze({
     profile: 'aggressive',
-    inactivityMinutes: 1,
+    inactivityMinutes: 5,
     youtubeHighRiskInactiveSeconds: 20,
     skipAudible: false,
   }),
@@ -85,7 +85,9 @@ export function mergeSettings(settings = {}) {
 
   return {
     profile,
-    inactivityMinutes: clampSettingNumber(settings.inactivityMinutes, defaults.inactivityMinutes, SETTINGS_LIMITS.inactivityMinutes),
+    inactivityMinutes: profile === 'aggressive'
+      ? PROFILE_SETTINGS.aggressive.inactivityMinutes
+      : clampSettingNumber(settings.inactivityMinutes, defaults.inactivityMinutes, SETTINGS_LIMITS.inactivityMinutes),
     youtubeVideoThreshold: clampSettingNumber(settings.youtubeVideoThreshold, defaults.youtubeVideoThreshold, SETTINGS_LIMITS.youtubeVideoThreshold),
     youtubeHighRiskInactiveSeconds: clampSettingNumber(
       settings.youtubeHighRiskInactiveSeconds,
@@ -157,7 +159,6 @@ export function applyPowerMode(settings = DEFAULT_SETTINGS, powerStatus = {}) {
     return {
       ...normalizedSettings,
       powerMode: 'battery',
-      inactivityMinutes: Math.min(Number(normalizedSettings.inactivityMinutes), 3),
       youtubeHighRiskInactiveSeconds: Math.min(Number(normalizedSettings.youtubeHighRiskInactiveSeconds), 45),
       aggressiveInactiveSeconds: Math.min(Number(normalizedSettings.aggressiveInactiveSeconds), 45),
     };
@@ -167,7 +168,6 @@ export function applyPowerMode(settings = DEFAULT_SETTINGS, powerStatus = {}) {
     return {
       ...normalizedSettings,
       powerMode: 'power',
-      inactivityMinutes: Math.max(Number(normalizedSettings.inactivityMinutes), 10),
       youtubeHighRiskInactiveSeconds: Math.max(Number(normalizedSettings.youtubeHighRiskInactiveSeconds), 120),
       aggressiveInactiveSeconds: Math.max(Number(normalizedSettings.aggressiveInactiveSeconds), 120),
     };
@@ -634,7 +634,14 @@ export function isPressureDomain(url, settings = DEFAULT_SETTINGS) {
   return isDomainMatched(url, normalizedSettings.pressureDomains);
 }
 
-export function buildSleepDecision({ tab, state = {}, settings = DEFAULT_SETTINGS, now = Date.now(), runtimeBaseUrl = '' }) {
+export function buildSleepDecision({
+  tab,
+  state = {},
+  settings = DEFAULT_SETTINGS,
+  now = Date.now(),
+  runtimeBaseUrl = '',
+  sameDomainTabCount = 1,
+}) {
   const normalizedSettings = mergeSettings(settings);
   const eligibility = getTabEligibility({ tab, state, settings: normalizedSettings, runtimeBaseUrl, allowActive: false });
 
@@ -642,8 +649,20 @@ export function buildSleepDecision({ tab, state = {}, settings = DEFAULT_SETTING
     return { sleep: false, reason: eligibility.reason };
   }
 
+  const mediaPlaying = Boolean(tab.audible || state.mediaPlaying);
+  if (mediaPlaying && Math.max(1, Number(sameDomainTabCount) || 1) === 1) {
+    return { sleep: false, reason: 'single-media-tab' };
+  }
+
   const lastActiveAt = Number(state.lastActiveAt ?? now);
   const inactiveMs = Math.max(0, now - lastActiveAt);
+  const inactivityMs = Number(normalizedSettings.inactivityMinutes) * 60_000;
+
+  if (normalizedSettings.profile === 'aggressive') {
+    return inactiveMs >= inactivityMs
+      ? { sleep: true, reason: 'inactive-timeout' }
+      : { sleep: false, reason: 'not-idle-long-enough' };
+  }
 
   if (shouldTreatYouTubeAsHighRisk(tab.url, state, normalizedSettings)) {
     const youtubeTimeoutMs = Number(normalizedSettings.youtubeHighRiskInactiveSeconds) * 1000;
@@ -659,7 +678,6 @@ export function buildSleepDecision({ tab, state = {}, settings = DEFAULT_SETTING
     }
   }
 
-  const inactivityMs = Number(normalizedSettings.inactivityMinutes) * 60_000;
   if (inactiveMs >= inactivityMs) {
     return { sleep: true, reason: 'inactive-timeout' };
   }

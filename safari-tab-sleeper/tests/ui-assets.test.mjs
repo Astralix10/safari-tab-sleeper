@@ -23,7 +23,7 @@ test('main extension UI is localized to Russian', async () => {
   assert.equal(manifest.action.default_title, 'Усыпить вкладки');
   assert.equal(popupHtml.includes('Усыпить текущую вкладку'), true);
   assert.equal(optionsHtml.includes('name="powerAware"'), true);
-  assert.equal(optionsHtml.includes('На батарее усыплять быстрее'), true);
+  assert.equal(optionsHtml.includes('На батарее очищать тяжёлые вкладки быстрее'), true);
   assert.equal(optionsHtml.includes('Настройки'), true);
   assert.equal(sleepHtml.includes('Вкладка спит'), true);
 });
