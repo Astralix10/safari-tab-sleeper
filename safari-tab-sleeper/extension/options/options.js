@@ -12,6 +12,7 @@ async function send(type, payload = {}) {
 function fillForm(settings) {
   form.profile.value = settings.profile ?? DEFAULT_SETTINGS.profile;
   form.inactivityMinutes.value = settings.inactivityMinutes;
+  form.inactivityMinutes.disabled = settings.profile === 'aggressive';
   form.youtubeVideoThreshold.value = settings.youtubeVideoThreshold;
   form.youtubeHighRiskInactiveSeconds.value = settings.youtubeHighRiskInactiveSeconds;
   form.aggressiveInactiveSeconds.value = settings.aggressiveInactiveSeconds;
@@ -67,6 +68,7 @@ form.addEventListener('submit', async (event) => {
     if (result?.ok === false) {
       throw new Error(result.reason || 'save-failed');
     }
+    fillForm(await send('tab-sleeper:get-settings'));
     status.textContent = 'Сохранено.';
     setTimeout(() => {
       status.textContent = '';

@@ -67,11 +67,13 @@ SLEEP_CURRENT_SCRIPT = os.environ.get(
     os.path.join(os.path.dirname(__file__), "sleep-current-tab.applescript"),
 )
 ARCHIVE_LOCK = threading.RLock()
+ACTIVE_ARCHIVE_TOKENS = None
 SETTINGS_LOCK = threading.RLock()
 TRUSTED_ORIGIN_LOCK = threading.RLock()
 HEARTBEAT_LOCK = threading.RLock()
 CLEANUP_REQUEST_LOCK = threading.RLock()
 LAST_EXTENSION_HEARTBEAT = 0.0
+LAST_EXTENSION_VERSION = ""
 PENDING_CLEANUP_REQUEST = None
 EXTENSION_HEARTBEAT_MAX_AGE_SECONDS = 15 * 60
 
@@ -149,6 +151,7 @@ SLEEP_HTML = r"""<!doctype html>
         'aggressive-domain': 'aggressive',
         'memory-pressure': 'memory',
         'memory-guard': 'memory',
+        'manual-memory-cleanup': 'memory',
         'manual-current-tab': 'manual',
         'manual-all-except-current': 'manual'
       };
@@ -200,40 +203,16 @@ SLEEP_HTML = r"""<!doctype html>
     }
 
     function normalizeRestorableUrl(value) {
-      const candidates = [];
-      const add = (candidate) => {
-        const text = String(candidate || '').trim();
-        if (text && !candidates.includes(text)) candidates.push(text);
-      };
-
-      const unwrapped = unwrapSleepUrl(value);
-      add(unwrapped);
-      let decoded = unwrapped;
-      for (let i = 0; i < 3; i += 1) {
-        const next = decodeURIComponentSafely(decoded);
-        if (next === decoded) break;
-        decoded = next;
-        add(decoded);
+      let candidate = unwrapSleepUrl(value);
+      if (candidate.startsWith('about:reader?')) candidate = new URL(candidate).searchParams.get('url') || '';
+      for (const prefix of ['x-safari-reader://', 'safari-reader://']) {
+        if (candidate.toLowerCase().startsWith(prefix)) candidate = decodeURIComponentSafely(candidate.slice(prefix.length));
       }
-
-      for (const candidate of [...candidates]) {
-        try {
-          const parsed = new URL(candidate);
-          for (const key of ['url', 'u', 'target']) add(parsed.searchParams.get(key));
-        } catch {}
-
-        for (const match of candidate.match(/https?:\/\/[^\s"'<>]+/gi) || []) {
-          add(match.replace(/[),.;]+$/, ''));
-        }
-      }
-
-      for (const candidate of candidates) {
-        try {
-          const parsed = new URL(candidate);
-          if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return parsed.toString();
-        } catch {}
-      }
-
+      try {
+        const parsed = new URL(candidate);
+        if (['127.0.0.1', 'localhost'].includes(parsed.hostname) && parsed.pathname === '/sleep') return '';
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return parsed.toString();
+      } catch {}
       return '';
     }
 
@@ -249,7 +228,7 @@ SLEEP_HTML = r"""<!doctype html>
     }
 
     function scheduleRestoreOnReturn() {
-      if (!restorableUrl || document.visibilityState !== 'visible') return;
+      if (!restorableUrl || entry.restoreOnFocus === false || document.visibilityState !== 'visible') return;
 
       const automaticDelay = getAutoRestoreDelay();
       const manualReturn = entry.reason === 'manual-current-tab' && wasHiddenAfterSleep;
@@ -619,11 +598,12 @@ def pair_extension_origin(origin):
         return True
 
 
-def mark_extension_heartbeat():
-    global LAST_EXTENSION_HEARTBEAT
+def mark_extension_heartbeat(body=None):
+    global LAST_EXTENSION_HEARTBEAT, LAST_EXTENSION_VERSION
     timestamp = time.time()
     with HEARTBEAT_LOCK:
         LAST_EXTENSION_HEARTBEAT = timestamp
+        LAST_EXTENSION_VERSION = str((body or {}).get("version") or "")[:32]
         try:
             heartbeat_dir = os.path.dirname(HEARTBEAT_PATH)
             if heartbeat_dir:
@@ -652,6 +632,7 @@ def collect_extension_state():
         "ok": True,
         "active": active,
         "ageSeconds": round(age_seconds, 1) if age_seconds is not None else None,
+        "version": LAST_EXTENSION_VERSION,
     }
 
 
@@ -687,6 +668,8 @@ def save_companion_settings(settings):
     allowlist = sanitize_domain_patterns(settings["allowlist"])
     pressure_domains = sanitize_domain_patterns(settings.get("pressureDomains", []))
     with SETTINGS_LOCK:
+        if settings_ready() and read_companion_settings() == {"allowlist": allowlist, "pressureDomains": pressure_domains}:
+            return {"ok": True, "ready": True, "allowlist": allowlist, "pressureDomains": pressure_domains}
         if read_allowlist() != allowlist:
             write_allowlist(allowlist)
         settings_dir = os.path.dirname(SETTINGS_PATH)
@@ -802,15 +785,19 @@ def sanitize_archive_entry(entry):
         "sleptAt": slept_at,
         "reason": str(entry.get("reason") or "inactive-timeout"),
         "autoRestore": entry.get("autoRestore") is not False,
+        "restoreOnFocus": entry.get("restoreOnFocus") is not False,
     }
 
 
 def load_archive_entries():
+    global ACTIVE_ARCHIVE_TOKENS
     with ARCHIVE_LOCK:
         try:
             with open(ARCHIVE_PATH, "r", encoding="utf-8") as file:
                 data = json.load(file)
             entries = data.get("entries", []) if isinstance(data, dict) else []
+            if ACTIVE_ARCHIVE_TOKENS is None:
+                ACTIVE_ARCHIVE_TOKENS = set(data.get("activeTokens", [])) if isinstance(data, dict) else set()
             return [entry for entry in entries if sanitize_archive_entry(entry)]
         except Exception:
             return []
@@ -824,16 +811,20 @@ def compact_archive_entries(entries):
     seen_urls = set()
     seen_tokens = set()
     compacted = []
+    inactive_count = 0
     for entry in clean_entries:
         url_key = normalize_archive_url(entry.get("url"))
         token_key = entry.get("token")
-        if not url_key or not token_key or url_key in seen_urls or token_key in seen_tokens:
+        active = token_key in (ACTIVE_ARCHIVE_TOKENS or set())
+        if not url_key or not token_key or token_key in seen_tokens:
+            continue
+        if not active and (url_key in seen_urls or inactive_count >= ARCHIVE_LIMIT):
             continue
         seen_urls.add(url_key)
         seen_tokens.add(token_key)
         compacted.append(entry)
-        if len(compacted) >= ARCHIVE_LIMIT:
-            break
+        if not active:
+            inactive_count += 1
 
     return compacted
 
@@ -845,8 +836,17 @@ def save_archive_entries(entries):
             os.makedirs(archive_dir, exist_ok=True)
         compacted = compact_archive_entries(entries)
         temp_path = f"{ARCHIVE_PATH}.tmp"
+        payload = {"entries": compacted, "activeTokens": sorted(ACTIVE_ARCHIVE_TOKENS or [])}
+        try:
+            with open(ARCHIVE_PATH, "r", encoding="utf-8") as file:
+                if json.load(file) == payload:
+                    return compacted
+        except (OSError, ValueError):
+            pass
         with open(temp_path, "w", encoding="utf-8") as file:
-            json.dump({"entries": compacted}, file, ensure_ascii=False, indent=2)
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
         os.replace(temp_path, ARCHIVE_PATH)
         return compacted
 
@@ -865,6 +865,42 @@ def archive_entry(entry):
         return clean_entry, save_archive_entries(entries)
 
 
+def update_archive(body):
+    global ACTIVE_ARCHIVE_TOKENS
+    with ARCHIVE_LOCK:
+        entries = load_archive_entries()
+        active_tokens = body.get("activeTokens")
+        if active_tokens is not None:
+            if not isinstance(active_tokens, list) or any(not isinstance(token, str) or not token for token in active_tokens):
+                raise ValueError("invalid-active-tokens")
+        action = body.get("action", "put")
+        if action == "delete":
+            token = body.get("token")
+            if not isinstance(token, str) or not token:
+                raise ValueError("invalid-token")
+            ACTIVE_ARCHIVE_TOKENS = set(ACTIVE_ARCHIVE_TOKENS or []) - {token}
+            entries = save_archive_entries([entry for entry in entries if entry["token"] != token])
+            return {"ok": True, "count": len(entries)}
+        if action == "reconcile":
+            if active_tokens is None:
+                raise ValueError("missing-active-tokens")
+            recovered = body.get("entries", [])
+            if not isinstance(recovered, list) or any(not sanitize_archive_entry(entry) for entry in recovered):
+                raise ValueError("invalid-archive-entry")
+            recovered_by_token = {entry["token"]: entry for entry in recovered if entry["token"] in active_tokens}
+            entries = [entry for entry in entries if entry["token"] not in recovered_by_token]
+            entries.extend(recovered_by_token.values())
+            ACTIVE_ARCHIVE_TOKENS = set(active_tokens)
+            entries = save_archive_entries(entries)
+            return {"ok": True, "count": len(entries)}
+        if action != "put" or not sanitize_archive_entry(body.get("entry")):
+            raise ValueError("invalid-archive-entry")
+        if active_tokens is not None:
+            ACTIVE_ARCHIVE_TOKENS = set(active_tokens)
+        entry, entries = archive_entry(body["entry"])
+        return {"ok": True, "entry": entry, "count": len(entries)}
+
+
 def find_archived_entry(token):
     with ARCHIVE_LOCK:
         entries = compact_archive_entries(load_archive_entries())
@@ -874,7 +910,16 @@ def find_archived_entry(token):
         return None, entries
 
 
+class SleeperHTTPServer(ThreadingHTTPServer):
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(10)
+
     def has_valid_host(self):
         host = str(self.headers.get("Host") or "").strip().lower()
         return host in (f"127.0.0.1:{PORT}", f"localhost:{PORT}")
@@ -992,12 +1037,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/sleep-current":
-            result = sleep_current_safari_tab()
-            self.send_json(200 if result.get("ok") else 409, result)
+            self.send_json(409, {"ok": False, "reason": "extension-required"})
             return
 
         if path == "/heartbeat":
-            self.send_json(200, mark_extension_heartbeat())
+            self.send_json(200, mark_extension_heartbeat(body))
             return
 
         if path == "/cleanup-request":
@@ -1012,11 +1056,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            entry, entries = archive_entry(body.get("entry"))
-            if not entry:
-                self.send_json(400, {"ok": False, "reason": "invalid-archive-entry", "count": len(entries)})
-                return
-            self.send_json(200, {"ok": True, "entry": entry, "count": len(entries)})
+            self.send_json(200, update_archive(body))
+        except (TypeError, ValueError, OverflowError):
+            self.send_json(400, {"ok": False, "reason": "invalid-archive-entry"})
         except Exception:
             self.send_json(500, {"ok": False, "reason": "archive-write-failed"})
 
@@ -1075,6 +1117,6 @@ if __name__ == "__main__":
     except BlockingIOError:
         raise SystemExit(0)
     save_archive_entries(load_archive_entries())
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server = SleeperHTTPServer((HOST, PORT), Handler)
     print(f"Safari Tab Sleeper server listening on http://{HOST}:{PORT}/sleep", flush=True)
     server.serve_forever()

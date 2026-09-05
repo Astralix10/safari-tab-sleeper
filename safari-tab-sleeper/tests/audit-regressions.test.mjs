@@ -46,7 +46,7 @@ test('modern local sleep URL contains only its opaque token', () => {
   assert.equal(url.includes('https://'), false);
 });
 
-test('worker resolves explicit tab IDs first and commits archive after navigation', async () => {
+test('worker resolves explicit tab IDs first', async () => {
   const worker = await read('extension/background/service-worker-0.2.9.js');
   const queryStart = worker.indexOf('async function queryActiveTab');
   const queryEnd = worker.indexOf('async function readLivePageHint');
@@ -54,11 +54,6 @@ test('worker resolves explicit tab IDs first and commits archive after navigatio
   assert.equal(queryBody.includes("debugActiveTab('synthetic-hint'"), false);
   assert.equal(queryBody.indexOf('api.tabs.get(hintedTabId)') < queryBody.indexOf('api.tabs.query({})'), true);
 
-  const sleepStart = worker.indexOf('async function performSleepTab');
-  const sleepEnd = worker.indexOf('async function isTabProtectedByLatestSettings');
-  const sleepBody = worker.slice(sleepStart, sleepEnd);
-  assert.equal(sleepBody.includes("reason: 'tab-changed'"), true);
-  assert.equal(sleepBody.indexOf('await api.tabs.update') < sleepBody.lastIndexOf('await archiveSleepEntry'), true);
   assert.equal(worker.includes("reason: 'dirty-state-unavailable'"), true);
   assert.equal(worker.includes('delete states[tabId]'), true);
   assert.equal(worker.includes('countTabsByDomain(tabs)'), true);

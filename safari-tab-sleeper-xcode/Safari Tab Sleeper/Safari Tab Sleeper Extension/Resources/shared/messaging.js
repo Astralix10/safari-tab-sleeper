@@ -1,6 +1,6 @@
 export const runtimeApi = globalThis.browser ?? globalThis.chrome;
 
-export function sendRuntimeMessage(message) {
+function deliverRuntimeMessage(message) {
   if (globalThis.browser?.runtime?.sendMessage) {
     return globalThis.browser.runtime.sendMessage(message);
   }
@@ -16,4 +16,17 @@ export function sendRuntimeMessage(message) {
       resolve(response);
     });
   });
+}
+
+export async function sendRuntimeMessage(message) {
+  let timer;
+  const timeoutMs = /restore-all|sleep-all|free-memory|sleep-inactive/.test(message?.type) ? 60_000 : 15_000;
+  try {
+    return await Promise.race([
+      deliverRuntimeMessage(message),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Расширение не ответило вовремя.')), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }

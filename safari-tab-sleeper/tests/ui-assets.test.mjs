@@ -58,7 +58,7 @@ test('popup uses one centered allowlist switch instead of fast-sleep shortcut', 
   assert.equal(popupJs.includes("'/active-tab'"), false);
   assert.equal(background.includes("'/active-tab'"), true);
   assert.equal(popupJs.includes('tab-sleeper:get-memory-status'), true);
-  assert.equal(popupJs.includes('settingsSchemaVersion: SETTINGS_SCHEMA_VERSION'), true);
+  assert.equal(popupJs.includes('api.storage.local.set'), false);
   assert.equal(popupJs.includes('activeTabHintFromState'), true);
   assert.equal(popupJs.includes("addEventListener('click'"), true);
   assert.equal(popupJs.includes('setAllowlistToggleValue'), true);
@@ -134,7 +134,7 @@ test('sleep pages auto-restore when returning to a manually slept background tab
   assert.equal(extensionSleepJs.includes("let wasHiddenAfterSleep = document.visibilityState === 'hidden';"), true);
   assert.equal(extensionSleepJs.includes('getSleepPageAutoRestoreDelay'), true);
   assert.equal(extensionSleepJs.includes("activeEntry.reason === 'manual-current-tab' && wasHiddenAfterSleep"), true);
-  assert.equal(extensionSleepJs.includes("throw new Error('missing-active-tab')"), true);
+  assert.equal(extensionSleepJs.includes('api.tabs.query'), false);
 
   assert.equal(sleeperServer.includes("let wasHiddenAfterSleep = document.visibilityState === 'hidden';"), true);
   assert.equal(sleeperServer.includes("entry.reason === 'manual-current-tab' && wasHiddenAfterSleep"), true);
@@ -162,8 +162,7 @@ test('memory cleanup is delegated to the protected extension eligibility path', 
   assert.equal(background.includes('scanInFlight'), true);
   assert.equal(background.includes('pendingTabSleeps'), true);
   assert.equal(background.includes('storageMutationQueues'), true);
-  assert.equal(background.includes('isTabProtectedByLatestSettings'), true);
-  assert.equal(background.includes("return { ok: false, reason: 'allowlisted' };"), true);
+  assert.equal(background.includes('validateSleepCommit'), true);
   assert.equal(background.includes("debugActiveTab('hinted-url-unique-match'"), true);
   assert.equal(background.includes('sleep-navigation-failed'), true);
   assert.equal(pageGuard.includes('window.setInterval(handleNavigationChange, 1000)'), false);
@@ -193,7 +192,7 @@ test('popup trusts the front Safari tab over stale extension state', async () =>
 
   assert.equal(companionLookup >= 0, true);
   assert.equal(extensionLookup > companionLookup, true);
-  assert.equal(popup.includes('hostnameFromUrl(hintedUrl) || state.currentHost'), true);
+  assert.equal(popup.includes('const state = backgroundState'), true);
   assert.equal(popup.includes('защита от усыпления включена'), true);
   assert.equal(popup.includes('sleepCurrentWithFallback'), true);
 });
@@ -226,9 +225,9 @@ test('release host app reports native errors and activates Safari settings', asy
 
   assert.equal(viewController.includes('self.showError(error.localizedDescription'), true);
   assert.equal(viewController.includes('resolveCompanionExtensionState'), true);
-  assert.equal(viewController.includes('resolveCompanionExtensionState(error: nil, in: webView)'), true);
+  assert.equal(viewController.includes('resolveCompanionExtensionState(error: nil, in: webView)'), false);
   assert.equal(viewController.includes('/extension-state'), true);
-  assert.equal(viewController.includes('if state.isEnabled'), true);
+  assert.equal(viewController.includes('showExtensionState(enabled: state.isEnabled'), true);
   assert.equal(viewController.includes('showExtensionState(enabled: true'), true);
   assert.equal(viewController.includes('safari?.activate(options:'), true);
   assert.equal(viewController.includes('if let error'), true);
@@ -245,7 +244,7 @@ test('worker rejects invalid YouTube reset tab IDs and protects every active win
   assert.equal(background.includes('Number.isInteger(targetTabId)'), true);
   assert.equal(background.includes('if (tab.id == null || tab.active)'), true);
   assert.equal(background.includes("reason: 'already-sleeping'"), true);
-  assert.equal(background.includes("'/sleep-current'"), true);
+  assert.equal(background.includes("'/sleep-current'"), false);
   assert.equal(background.includes("'/heartbeat'"), true);
   assert.equal(background.includes('syncExtensionHeartbeat'), true);
 });

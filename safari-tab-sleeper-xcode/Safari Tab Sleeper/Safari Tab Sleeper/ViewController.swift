@@ -31,8 +31,6 @@ class ViewController: NSViewController, WKNavigationDelegate, WKScriptMessageHan
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        resolveCompanionExtensionState(error: nil, in: webView)
-
         SFSafariExtensionManager.getStateOfSafariExtension(withIdentifier: extensionBundleIdentifier) { (state, error) in
             guard let state = state, error == nil else {
                 self.resolveCompanionExtensionState(error: error, in: webView)
@@ -40,11 +38,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKScriptMessageHan
             }
 
             DispatchQueue.main.async {
-                if state.isEnabled {
-                    self.showExtensionState(enabled: true, in: webView)
-                } else {
-                    self.resolveCompanionExtensionState(error: nil, in: webView)
-                }
+                self.showExtensionState(enabled: state.isEnabled, in: webView)
             }
         }
     }
@@ -55,11 +49,11 @@ class ViewController: NSViewController, WKNavigationDelegate, WKScriptMessageHan
             return
         }
 
-        URLSession.shared.dataTask(with: url) { data, response, _ in
+        let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 3)
+        URLSession.shared.dataTask(with: request) { data, response, _ in
             let statusCode = (response as? HTTPURLResponse)?.statusCode
-            let state = data.flatMap { try? JSONDecoder().decode(CompanionExtensionState.self, from: $0) }
-
             DispatchQueue.main.async {
+                let state = data.flatMap { try? JSONDecoder().decode(CompanionExtensionState.self, from: $0) }
                 guard statusCode == 200, state?.ok == true, state?.active == true else {
                     if let error {
                         self.showError(error.localizedDescription, in: webView)
@@ -107,7 +101,7 @@ class ViewController: NSViewController, WKNavigationDelegate, WKScriptMessageHan
                     let safari = NSRunningApplication.runningApplications(
                         withBundleIdentifier: "com.apple.Safari"
                     ).first
-                    safari?.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+                    safari?.activate(options: [.activateAllWindows])
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
                         NSApplication.shared.terminate(nil)
                     }

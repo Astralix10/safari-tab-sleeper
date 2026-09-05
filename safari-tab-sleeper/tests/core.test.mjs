@@ -173,6 +173,23 @@ test('manual sleep cannot bypass a protected site', () => {
   assert.deepEqual(decision, { eligible: false, reason: 'allowlisted' });
 });
 
+test('an exact rule covered by a wildcard cannot falsely report protection disabled', () => {
+  assert.deepEqual(setAllowlistForHost(['app.example.com', '*.example.com'], 'app.example.com', false), {
+    enabled: true, allowlist: ['app.example.com', '*.example.com'], blockedByPattern: true,
+  });
+});
+
+test('balanced mode protects muted video and skips loading or already discarded pages', () => {
+  for (const extra of [{ status: 'loading' }, { discarded: true }]) {
+    assert.equal(buildSleepDecision({ tab: { id: 1, url: 'https://example.com', ...extra }, state: { lastActiveAt: 0 }, now: 500_000 }).sleep, false);
+  }
+  assert.equal(buildSleepDecision({ tab: { id: 1, url: 'https://example.com' }, state: { lastActiveAt: 0, mediaPlaying: true }, now: 500_000, sameDomainTabCount: 2 }).sleep, false);
+});
+
+test('the restore watchdog respects restoreOnFocus being disabled', () => {
+  assert.equal(shouldHealStuckSleepTab({ tab: { active: true, url: buildLocalSleepPageUrl(DEFAULT_SETTINGS.sleepServerUrl, 'token') }, settings: { ...DEFAULT_SETTINGS, restoreOnFocus: false } }), false);
+});
+
 test('profiles tune sleep timing and media behavior', () => {
   assert.deepEqual(applyProfile('safe'), {
     profile: 'safe',

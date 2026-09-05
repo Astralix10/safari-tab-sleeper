@@ -14,7 +14,7 @@ It helps keep Safari under control when long-lived tabs, especially YouTube, Twi
 - Sleeps inactive tabs after a configurable timeout.
 - Restores sleeping tabs automatically when selected.
 - Retries stuck sleeping tabs if Safari misses the first restore event.
-- Keeps original tab titles and favicons visible with `[sleep]` prefixes.
+- Keeps original tab titles with `[sleep]` prefixes. Embedded icons are retained; remote favicons are not fetched by sleeping tabs.
 - Backs up sleeping-tab restore data in a local archive.
 - Compacts duplicate archived URLs so old repeated links do not grow forever.
 - Unwraps legacy and nested sleep links before restoring or archiving them.
@@ -42,23 +42,26 @@ npm run build:menubar
 Build the Safari app:
 
 ```zsh
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-xcodebuild -project "safari-tab-sleeper-xcode/Safari Tab Sleeper/Safari Tab Sleeper.xcodeproj" \
-  -scheme "Safari Tab Sleeper" \
-  -configuration Release \
-  -derivedDataPath "safari-tab-sleeper-xcode/DerivedData-Release" \
-  build
+./script/build_and_run.sh --build-only
 ```
 
 Install locally:
 
 ```zsh
-rm -rf "$HOME/Applications/Safari Tab Sleeper.app"
-ditto "safari-tab-sleeper-xcode/DerivedData-Release/Build/Products/Release/Safari Tab Sleeper.app" \
-  "$HOME/Applications/Safari Tab Sleeper.app"
+./script/build_and_run.sh --install-only
 ```
 
 Then open the app once and enable the extension in Safari Settings -> Extensions.
+
+The script reuses the existing companion token, synchronizes WebExtension resources into Xcode, builds Release, verifies signing, and updates the app at `~/Applications/Safari Tab Sleeper.app`. Without flags it also opens the host app. It never quits Safari automatically. Restart Safari after an update to load its new background worker.
+
+If an Xcode update reports incompatible developer frameworks, run the official `xcodebuild -runFirstLaunch` setup before building.
+
+## Release 0.3.11
+
+This release fixes sleep/restore races, media protection in embedded frames, simultaneous allowlist edits, stale playback state, and recovery records deleted while tabs were still open. It includes executable worker integration tests. See [the audit report](AUDIT-2026-09-05.md).
+
+The aggressive profile waits five minutes after leaving a tab. A one-minute alarm checks due tabs; browser scheduling or a sleeping Mac may delay execution. Active, pinned, protected and unsaved-data tabs are excluded. A playing media tab is protected when it is the only loaded tab for its domain.
 
 ## Companion
 

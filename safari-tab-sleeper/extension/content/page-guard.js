@@ -4,7 +4,9 @@
   let youtubeVideoCount = 0;
   let youtubeLastVideoUrl = '';
   let lastHref = location.href;
+  let lastSentState = '';
   const fieldSnapshots = new WeakMap();
+  const editableSelector = 'input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]), textarea, select, [contenteditable="true"]';
 
   function isEditableElement(target) {
     if (!target) {
@@ -12,7 +14,8 @@
     }
 
     const tagName = target.tagName?.toLowerCase();
-    return target.isContentEditable || tagName === 'textarea' || tagName === 'select' || tagName === 'input';
+    return target.isContentEditable || tagName === 'textarea' || tagName === 'select'
+      || (tagName === 'input' && !['hidden', 'button', 'submit', 'reset'].includes(target.type));
   }
 
   function youtubeVideoIdentity(url) {
@@ -46,7 +49,7 @@
   }
 
   function rememberFields(root = document) {
-    for (const field of root.querySelectorAll?.('input, textarea, select, [contenteditable="true"]') ?? []) {
+    for (const field of root.querySelectorAll?.(editableSelector) ?? []) {
       if (!fieldSnapshots.has(field)) {
         fieldSnapshots.set(field, fieldValue(field));
       }
@@ -55,7 +58,7 @@
 
   function hasProgrammaticFieldChanges() {
     rememberFields();
-    for (const field of document.querySelectorAll('input, textarea, select, [contenteditable="true"]')) {
+    for (const field of document.querySelectorAll(editableSelector)) {
       if (fieldSnapshots.get(field) !== fieldValue(field)) {
         return true;
       }
@@ -70,7 +73,7 @@
 
   function sendState() {
     try {
-      Promise.resolve(api.runtime.sendMessage({
+      const state = {
         type: 'tab-sleeper:page-state',
         pageUrl: location.href,
         pageTitle: document.title,
@@ -78,11 +81,32 @@
         mediaPlaying: mediaIsPlaying(),
         youtubeVideoCount,
         youtubeLastVideoUrl,
-      })).catch(() => undefined);
+      };
+      const signature = JSON.stringify(state);
+      if (signature === lastSentState) return;
+      lastSentState = signature;
+      Promise.resolve(api.runtime.sendMessage(state)).catch(() => { lastSentState = ''; });
     } catch {
+      lastSentState = '';
       // The background worker may be asleep or unavailable.
     }
   }
+
+  function readPageState() {
+    dirty ||= hasProgrammaticFieldChanges();
+    return {
+      canSleep: !dirty,
+      dirty,
+      mediaPlaying: mediaIsPlaying(),
+      pageUrl: location.href,
+      pageTitle: document.title,
+      youtubeVideoCount,
+      youtubeLastVideoUrl,
+    };
+  }
+
+  // Available only in the extension's isolated world, including subframes.
+  globalThis.__tabSleeperReadState = readPageState;
 
   function handleNavigationChange() {
     const href = location.href;
@@ -140,32 +164,26 @@
     };
   }
 
-  api.runtime.onMessage.addListener((message) => {
+  api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === 'tab-sleeper:get-page-info') {
-      return Promise.resolve({
+      sendResponse({
         pageUrl: location.href,
         pageTitle: document.title,
       });
+      return false;
     }
 
     if (message?.type === 'tab-sleeper:can-sleep') {
-      dirty ||= hasProgrammaticFieldChanges();
-      return Promise.resolve({
-        canSleep: !dirty,
-        dirty,
-        mediaPlaying: mediaIsPlaying(),
-        pageUrl: location.href,
-        pageTitle: document.title,
-        youtubeVideoCount,
-        youtubeLastVideoUrl,
-      });
+      sendResponse(readPageState());
+      return false;
     }
 
     if (message?.type === 'tab-sleeper:reset-youtube-counter') {
       youtubeVideoCount = 0;
       youtubeLastVideoUrl = youtubeVideoIdentity(location.href);
       sendState();
-      return Promise.resolve({ ok: true });
+      sendResponse({ ok: true });
+      return false;
     }
 
     return false;

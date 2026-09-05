@@ -57,9 +57,24 @@ let sleepQueue = Promise.resolve();
 let scanInFlight = null;
 let settingsInitialization = null;
 let companionSettingsSyncQueue = Promise.resolve();
+let lastCompanionSettings = '';
+let lastCompanionSyncAt = 0;
+const activeTabsByWindow = new Map();
+const pendingTabRestores = new Map();
 let lastActiveTabId = null;
 let lastActiveWindowId = null;
 let activeTabDebug = { source: 'not-queried' };
+
+async function boundedPageRequest(request, timeoutMs = 2000) {
+  let timer;
+  try {
+    return await Promise.race([request, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('page-state-timeout')), timeoutMs);
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function domainKeyFromUrl(url) {
   const host = hostnameFromUrl(url);
@@ -73,7 +88,7 @@ function countTabsByDomain(tabs) {
   const counts = new Map();
   for (const tab of tabs) {
     const key = domainKeyFromUrl(tab?.url);
-    if (key) {
+    if (key && !tab.discarded && !isKnownSleepPageUrl(tab.url, DEFAULT_SETTINGS, RUNTIME_BASE_URL)) {
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
   }
@@ -96,6 +111,7 @@ function rememberActiveTab(tabId, windowId = null) {
   lastActiveTabId = tabId;
   if (windowId != null) {
     lastActiveWindowId = windowId;
+    activeTabsByWindow.set(windowId, tabId);
   }
 }
 
@@ -113,6 +129,7 @@ function debugActiveTab(source, tab, hint = {}) {
 }
 
 async function readSettings() {
+  await (storageMutationQueues.get(STORAGE_KEYS.settings) ?? Promise.resolve());
   const result = await api.storage.local.get([
     STORAGE_KEYS.settings,
     STORAGE_KEYS.settingsSchemaVersion,
@@ -149,13 +166,15 @@ async function initializeSettingsFromCompanion(storedSettings = null) {
   return settings;
 }
 
-async function writeSettings(settings) {
-  const mergedSettings = mergeSettings(settings);
-  await api.storage.local.set({
-    [STORAGE_KEYS.settings]: mergedSettings,
-    [STORAGE_KEYS.settingsSchemaVersion]: SETTINGS_SCHEMA_VERSION,
+async function writeSettings(update) {
+  await readSettings();
+  const mergedSettings = await mutateObject(STORAGE_KEYS.settings, (stored) => {
+    const next = mergeSettings(typeof update === 'function' ? update(mergeSettings(stored)) : update);
+    Object.assign(stored, next);
+    return next;
   });
-  await syncCompanionSettings(mergedSettings);
+  void syncCompanionSettings(mergedSettings);
+  return mergedSettings;
 }
 
 async function readObject(key) {
@@ -215,6 +234,8 @@ async function ensureTabState(tab, knownState = null) {
     if (tab.title !== state.title) patch.title = tab.title;
     if (tab.url !== state.url) patch.url = tab.url;
     if (tab.favIconUrl !== state.favIconUrl) patch.favIconUrl = tab.favIconUrl;
+    if (tab.active !== state.wasActive) patch.wasActive = tab.active;
+    if (tab.windowId !== state.windowId) patch.windowId = tab.windowId;
     if (tab.active) patch.lastActiveAt = now;
     return Object.keys(patch).length > 0 ? patchTabState(tab.id, patch) : state;
   }
@@ -227,6 +248,8 @@ async function ensureTabState(tab, knownState = null) {
       lastActiveAt: now,
       dirty: false,
       mediaPlaying: false,
+      wasActive: tab.active,
+      windowId: tab.windowId,
       youtubeVideoCount: 0,
       ...current,
       title: tab.title,
@@ -242,39 +265,32 @@ async function ensureTabState(tab, knownState = null) {
 async function askPageCanSleep(tab, settings, state) {
   let response = null;
   try {
-    response = await api.tabs.sendMessage(tab.id, { type: 'tab-sleeper:can-sleep' });
+    response = await boundedPageRequest(api.tabs.sendMessage(tab.id, { type: 'tab-sleeper:can-sleep' }, { frameId: 0 }));
   } catch {
     // Older Safari tabs may have no content-script receiver yet.
   }
 
-  if (response && typeof response === 'object') {
-    const youtubeState = mergeYouTubePageState(state, response);
-    await patchTabState(tab.id, {
-      dirty: Boolean(response.dirty),
-      mediaPlaying: Boolean(response.mediaPlaying),
-      pageUrl: response.pageUrl,
-      pageTitle: response.pageTitle,
-      ...youtubeState,
-    });
-    return {
-      canSleep: settings.protectDirtyForms ? response.canSleep !== false : true,
-      dirty: Boolean(response.dirty),
-      mediaPlaying: Boolean(response.mediaPlaying),
-    };
-  }
-
   if (api.scripting?.executeScript) {
     try {
-      const results = await api.scripting.executeScript({
-        target: { tabId: tab.id },
+      const results = await boundedPageRequest(api.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
         func: () => {
-          const fields = document.querySelectorAll('input, textarea, select, [contenteditable="true"]');
+          if (typeof globalThis.__tabSleeperReadState === 'function') {
+            return globalThis.__tabSleeperReadState();
+          }
+          const fields = document.querySelectorAll('input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]), textarea, select, [contenteditable="true"]');
           const dirty = Array.from(fields).some((field) => {
             if (field instanceof HTMLInputElement && (field.type === 'checkbox' || field.type === 'radio')) {
               return field.checked !== field.defaultChecked;
             }
             if (field instanceof HTMLSelectElement) {
-              return Array.from(field.options).some((option) => option.selected !== option.defaultSelected);
+              const options = Array.from(field.options);
+              let expectedIndex = -1;
+              if (!field.multiple) {
+                for (let index = 0; index < options.length; index++) if (options[index].defaultSelected) expectedIndex = index;
+                if (expectedIndex < 0) expectedIndex = options.findIndex((option) => !option.disabled);
+              }
+              return options.some((option, index) => option.selected !== (field.multiple ? option.defaultSelected : index === expectedIndex));
             }
             if (field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) {
               return field.value !== field.defaultValue;
@@ -285,30 +301,35 @@ async function askPageCanSleep(tab, settings, state) {
             .some((media) => !media.paused && !media.ended && media.readyState > 0);
           return { canSleep: !dirty, dirty, mediaPlaying, pageUrl: location.href, pageTitle: document.title };
         },
-      });
-      response = results?.[0]?.result;
-      if (response && typeof response === 'object') {
-        await patchTabState(tab.id, {
-          dirty: Boolean(response.dirty),
-          mediaPlaying: Boolean(response.mediaPlaying),
-          pageUrl: response.pageUrl,
-          pageTitle: response.pageTitle,
-        });
-        return {
-          canSleep: settings.protectDirtyForms ? response.canSleep !== false : true,
-          dirty: Boolean(response.dirty),
-          mediaPlaying: Boolean(response.mediaPlaying),
-          injectedGuard: true,
+      }));
+      const topFrame = results?.find((frame) => frame.frameId === 0)?.result;
+      const frames = results?.map((frame) => frame.result).filter((frame) => typeof frame?.dirty === 'boolean') ?? [];
+      if (typeof topFrame?.dirty === 'boolean' && frames.length === results.length) {
+        response = {
+          ...topFrame,
+          dirty: frames.some((frame) => frame.dirty),
+          mediaPlaying: frames.some((frame) => frame.mediaPlaying),
         };
+      } else {
+        response = null;
       }
     } catch {
-      // Restricted pages are handled conservatively below.
+      // A top-frame response cannot prove that embedded forms and media are safe.
+      response = null;
     }
   }
 
-  if (!settings.protectDirtyForms) {
-    return { canSleep: true, dirty: false, mediaPlaying: Boolean(tab.audible), missingContentScript: true };
+  if (typeof response?.dirty === 'boolean' && typeof response?.mediaPlaying === 'boolean') {
+    await patchTabState(tab.id, {
+      dirty: response.dirty,
+      mediaPlaying: response.mediaPlaying,
+      pageUrl: response.pageUrl,
+      pageTitle: response.pageTitle,
+      ...mergeYouTubePageState(state, response),
+    });
+    return { ...response, canSleep: !settings.protectDirtyForms || !response.dirty };
   }
+
   return { canSleep: false, reason: 'dirty-state-unavailable', mediaPlaying: Boolean(tab.audible), missingContentScript: true };
 }
 
@@ -385,7 +406,7 @@ async function readLocalJson(settings, pathname, options = {}) {
     if (!response.ok) {
       return null;
     }
-    return response.json();
+    return await response.json();
   } catch {
     return null;
   } finally {
@@ -406,8 +427,9 @@ function resolveActiveTab(tab, state = {}, hint = {}) {
     return null;
   }
 
-  const knownUrl = normalizeRestorableUrl(hint.currentUrl)
-    || normalizeRestorableUrl(tab.url)
+  if (tab.url && (isKnownSleepPageUrl(tab.url, DEFAULT_SETTINGS, RUNTIME_BASE_URL) || !normalizeRestorableUrl(tab.url))) return tab;
+  const knownUrl = normalizeRestorableUrl(tab.url)
+    || normalizeRestorableUrl(hint.currentUrl)
     || normalizeRestorableUrl(state.pageUrl)
     || normalizeRestorableUrl(state.url);
   if (!knownUrl) {
@@ -431,21 +453,22 @@ function tabMatchesHintUrl(tab, hintedUrl) {
 async function queryActiveTab(hint = {}) {
   const hintedUrl = normalizeRestorableUrl(hint.currentUrl);
   const hintedTabId = Number(hint.currentTabId);
-  if (Number.isFinite(hintedTabId) && hintedTabId >= 0) {
+  if (hint.currentTabId != null && Number.isInteger(hintedTabId) && hintedTabId >= 0) {
     try {
       const hintedTab = await api.tabs.get(hintedTabId);
       if (hintedTab && tabMatchesHintUrl(hintedTab, hintedUrl)) {
         return debugActiveTab('hinted-tab', hintedTab, hint);
       }
+      return debugActiveTab('stale-tab-hint', null, hint);
     } catch {
-      // Safari can rotate tab IDs while restoring a window; fall through to a query.
+      return debugActiveTab('missing-hinted-tab', null, hint);
     }
   }
 
   if (lastActiveTabId != null) {
     try {
       const rememberedTab = await api.tabs.get(lastActiveTabId);
-      if (rememberedTab && tabMatchesHintUrl(rememberedTab, hintedUrl)) {
+      if (rememberedTab?.active && tabMatchesHintUrl(rememberedTab, hintedUrl)) {
         return debugActiveTab('remembered-tab', rememberedTab, hint);
       }
     } catch {
@@ -548,7 +571,7 @@ async function resolveCurrentTab(hint = {}) {
 
   let state = await getTabState(rawTab.id);
   let tab = resolveActiveTab(rawTab, state, hint);
-  if (hostnameFromUrl(tab?.url)) {
+  if (tab?.url) {
     return { tab, state };
   }
 
@@ -583,29 +606,39 @@ async function readRuntimeSettings() {
 }
 
 async function archiveSleepEntry(settings, entry) {
-  await readLocalJson(settings, '/archive-entry', {
+  const tabs = await api.tabs.query({});
+  return readLocalJson(settings, '/archive-entry', {
     timeoutMs: 900,
     fetchOptions: {
       method: 'POST',
       headers: companionMutationHeaders(),
-      body: JSON.stringify({ entry }),
+      body: JSON.stringify({ entry, activeTokens: [...new Set([
+        ...tabs.map((tab) => extractKnownSleepToken(tab.url, settings)).filter(Boolean),
+        entry.token,
+      ])] }),
     },
   });
 }
 
 function syncCompanionSettings(settings) {
   const snapshot = mergeSettings(settings);
-  const operation = companionSettingsSyncQueue.then(() => readLocalJson(snapshot, '/settings', {
-    timeoutMs: 1500,
-    fetchOptions: {
-      method: 'POST',
-      headers: companionMutationHeaders(),
-      body: JSON.stringify({
-        allowlist: snapshot.allowlist ?? [],
-        pressureDomains: snapshot.pressureDomains ?? [],
-      }),
-    },
-  }));
+  const body = JSON.stringify({ allowlist: snapshot.allowlist, pressureDomains: snapshot.pressureDomains });
+  const operation = companionSettingsSyncQueue.then(async () => {
+    if (body === lastCompanionSettings && Date.now() - lastCompanionSyncAt < 60_000) return null;
+    const result = await readLocalJson(snapshot, '/settings', {
+      timeoutMs: 1500,
+      fetchOptions: {
+        method: 'POST',
+        headers: companionMutationHeaders(),
+        body,
+      },
+    });
+    if (result?.ok) {
+      lastCompanionSettings = body;
+      lastCompanionSyncAt = Date.now();
+    }
+    return result;
+  });
   companionSettingsSyncQueue = operation.catch(() => null);
   return operation;
 }
@@ -616,7 +649,7 @@ function syncExtensionHeartbeat(settings) {
     fetchOptions: {
       method: 'POST',
       headers: companionMutationHeaders(),
-      body: '{}',
+      body: JSON.stringify({ version: api.runtime.getManifest?.().version || '' }),
     },
   });
 }
@@ -716,7 +749,7 @@ async function rollbackSleepPreparation(tabId, token) {
 }
 
 async function performSleepTab(tab, reason, options = {}) {
-  const settings = options.settings ?? (await readRuntimeSettings()).settings;
+  const settings = applyPowerMode(await readSettings(), { source: options.settings?.powerMode });
   if (isKnownSleepPageUrl(tab?.url, settings, RUNTIME_BASE_URL)) {
     return { ok: false, reason: 'already-sleeping' };
   }
@@ -755,10 +788,6 @@ async function performSleepTab(tab, reason, options = {}) {
     return { ok: false, reason: decision.reason };
   }
 
-  if (await isTabProtectedByLatestSettings(tab, settings)) {
-    return { ok: false, reason: 'allowlisted' };
-  }
-
   let currentTab;
   try {
     currentTab = await api.tabs.get(tab.id);
@@ -769,6 +798,8 @@ async function performSleepTab(tab, reason, options = {}) {
     return { ok: false, reason: 'tab-changed' };
   }
   tab = currentTab;
+  const initialValidation = await validateSleepCommit(tab, stateForDecision, options);
+  if (!initialValidation.ok) return initialValidation;
 
   const token = makeSleepToken();
   const restorableUrl = normalizeRestorableUrl(tab.url);
@@ -786,6 +817,7 @@ async function performSleepTab(tab, reason, options = {}) {
     sleptAt,
     reason,
     autoRestore: AUTO_RESTORE_REASONS.has(reason),
+    restoreOnFocus: settings.restoreOnFocus,
   };
   const strategy = chooseUnloadStrategy({
     tab,
@@ -794,8 +826,14 @@ async function performSleepTab(tab, reason, options = {}) {
   });
 
   if (strategy === 'native-discard') {
+    let discardedTab = null;
     try {
       await api.tabs.discard(tab.id);
+      discardedTab = await api.tabs.get(tab.id);
+    } catch {
+      // Unsupported discard falls back to a sleep page after another validation.
+    }
+    if (discardedTab?.discarded && tabIdentityMatches(tab, discardedTab)) {
       await mutateObject(STORAGE_KEYS.sleepingTabs, (sleepingTabs) => {
         sleepingTabs[token] = sleepEntry;
       });
@@ -807,8 +845,6 @@ async function performSleepTab(tab, reason, options = {}) {
       });
       await archiveSleepEntry(settings, sleepEntry);
       return { ok: true, token, reason, strategy };
-    } catch {
-      // Safari may not expose native discard; continue with the sleep page.
     }
   }
 
@@ -817,33 +853,61 @@ async function performSleepTab(tab, reason, options = {}) {
     return { ok: false, reason: 'sleep-server-unavailable' };
   }
 
-  try {
-    currentTab = await api.tabs.get(tab.id);
-  } catch {
-    return { ok: false, reason: 'missing-tab' };
+  // The local page only has a token. Its recovery record must be durable first.
+  const archive = await archiveSleepEntry(settings, sleepEntry);
+  if (!archive?.ok) {
+    return { ok: false, reason: 'archive-unavailable' };
   }
-  if (!tabIdentityMatches(tab, currentTab)) {
-    return { ok: false, reason: 'tab-changed' };
-  }
-
-  await mutateObject(STORAGE_KEYS.sleepingTabs, (sleepingTabs) => {
-    sleepingTabs[token] = sleepEntry;
-  });
-  await patchTabState(tab.id, {
-    sleepToken: token,
-    sleptAt,
-    dirty: false,
-    sleepStrategy: 'sleep-page',
-  });
-
   try {
+    await mutateObject(STORAGE_KEYS.sleepingTabs, (sleepingTabs) => {
+      sleepingTabs[token] = sleepEntry;
+    });
+    await patchTabState(tab.id, { sleepToken: token, sleptAt, sleepStrategy: 'sleep-page' });
+    const finalGuard = await askPageCanSleep(tab, await readSettings(), await getTabState(tab.id));
+    const validation = finalGuard.canSleep
+      ? await validateSleepCommit(tab, finalGuard, options)
+      : { ok: false, reason: finalGuard.reason || 'dirty-form' };
+    if (!validation.ok) {
+      await rollbackSleepPreparation(tab.id, token);
+      await deleteArchivedSleepEntry(settings, token);
+      return validation;
+    }
     await api.tabs.update(tab.id, { url: sleepUrl });
   } catch {
     await rollbackSleepPreparation(tab.id, token);
+    await deleteArchivedSleepEntry(settings, token);
     return { ok: false, reason: 'sleep-navigation-failed' };
   }
-  await archiveSleepEntry(settings, sleepEntry);
   return { ok: true, token, reason, strategy: 'sleep-page' };
+}
+
+async function deleteArchivedSleepEntry(settings, token) {
+  return readLocalJson(settings, '/archive-entry', {
+    fetchOptions: { method: 'POST', body: JSON.stringify({ action: 'delete', token }) },
+  });
+}
+
+async function validateSleepCommit(expectedTab, guard, options) {
+  const settings = applyPowerMode(await readSettings(), { source: options.settings?.powerMode });
+  const state = await getTabState(expectedTab.id);
+  const sameDomainTabCount = await countSameDomainTabs(expectedTab);
+  let tab;
+  try {
+    tab = await api.tabs.get(expectedTab.id);
+  } catch {
+    return { ok: false, reason: 'missing-tab' };
+  }
+  if (!tabIdentityMatches(expectedTab, tab)) return { ok: false, reason: 'tab-changed' };
+  if (options.manual && options.allowActive !== true && tab.active) return { ok: false, reason: 'active-tab' };
+  if (!options.manual && tab.active) return { ok: false, reason: 'active-tab' };
+  const liveState = { ...state, dirty: state.dirty || guard.dirty, mediaPlaying: guard.mediaPlaying || state.mediaPlaying };
+  if (!options.manual && (tab.audible || liveState.mediaPlaying) && sameDomainTabCount === 1) {
+    return { ok: false, reason: 'single-media-tab' };
+  }
+  const decision = options.manual || options.immediate
+    ? buildManualSleepDecision({ tab, state: liveState, settings, runtimeBaseUrl: RUNTIME_BASE_URL })
+    : buildSleepDecision({ tab, state: liveState, settings, sameDomainTabCount, runtimeBaseUrl: RUNTIME_BASE_URL });
+  return { ok: Boolean(decision.eligible ?? decision.sleep), reason: decision.reason };
 }
 
 function tabIdentityMatches(expected, current) {
@@ -852,19 +916,15 @@ function tabIdentityMatches(expected, current) {
     && normalizeRestorableUrl(expected.url) === normalizeRestorableUrl(current.url);
 }
 
-async function isTabProtectedByLatestSettings(tab, fallbackSettings) {
-  let storedSettings = mergeSettings(fallbackSettings);
-  try {
-    const stored = await api.storage.local.get(STORAGE_KEYS.settings);
-    storedSettings = mergeSettings(stored[STORAGE_KEYS.settings] ?? storedSettings);
-  } catch {
-    // The companion snapshot below is an independent fallback.
-  }
-
-  return isAllowlisted(tab?.url, storedSettings.allowlist);
+async function restoreSleepingTab(tabId, token) {
+  if (!Number.isInteger(tabId) || tabId < 0) return { ok: false, reason: 'missing-tab' };
+  if (pendingTabRestores.has(tabId)) return pendingTabRestores.get(tabId);
+  const operation = performRestoreSleepingTab(tabId, token);
+  pendingTabRestores.set(tabId, operation);
+  return operation.finally(() => pendingTabRestores.delete(tabId));
 }
 
-async function restoreSleepingTab(tabId, token) {
+async function performRestoreSleepingTab(tabId, token) {
   const settings = await readSettings();
   const sleepingTabs = await readObject(STORAGE_KEYS.sleepingTabs);
   const entry = sleepingTabs[token] ?? await readArchivedSleepEntry(settings, token);
@@ -872,7 +932,10 @@ async function restoreSleepingTab(tabId, token) {
   if (!restorableUrl) {
     return { ok: false, reason: 'missing-sleep-entry' };
   }
-
+  const tab = await api.tabs.get(tabId);
+  const matchesSleepPage = extractKnownSleepToken(tab.url, settings) === token;
+  const matchesNativeSleep = tab.discarded && entry.tabId === tabId && normalizeRestorableUrl(tab.url) === restorableUrl;
+  if (!matchesSleepPage && !matchesNativeSleep) return { ok: false, reason: 'tab-changed' };
   await api.tabs.update(tabId, { url: restorableUrl });
   await mutateObject(STORAGE_KEYS.sleepingTabs, (currentSleepingTabs) => {
     delete currentSleepingTabs[token];
@@ -886,14 +949,15 @@ async function restoreSleepingTab(tabId, token) {
   return { ok: true, url: restorableUrl };
 }
 
-async function maybeRestoreOnFocus(tab) {
-  const { settings } = await readRuntimeSettings();
+async function maybeRestoreOnFocus(tab, restoreManual = false) {
+  const settings = await readSettings();
   if (!settings.restoreOnFocus || !tab?.url) {
     return;
   }
 
   const token = extractKnownSleepToken(tab.url, settings);
   if (token) {
+    if (!restoreManual && (await getSleepEntry(token))?.autoRestore === false) return;
     const result = await restoreSleepingTab(tab.id, token);
     if (!result?.ok) {
       scheduleStuckSleepHeal(tab, settings);
@@ -921,7 +985,9 @@ function scheduleStuckSleepHeal(tab, settings) {
         && shouldHealStuckSleepTab({ tab: currentTab, settings, runtimeBaseUrl: RUNTIME_BASE_URL })
         && extractKnownSleepToken(currentTab.url, settings) === token
       ) {
-        await restoreSleepingTab(currentTab.id, token);
+        if ((await getSleepEntry(token))?.autoRestore !== false) {
+          await restoreSleepingTab(currentTab.id, token);
+        }
       }
     } catch {
       // The tab may have closed before the retry.
@@ -931,7 +997,7 @@ function scheduleStuckSleepHeal(tab, settings) {
   }, 1800);
 }
 
-async function markTabActive(tabId) {
+async function markTabActive(tabId, restoreManual = false) {
   try {
     const tab = await api.tabs.get(tabId);
     await patchTabState(tabId, {
@@ -939,8 +1005,10 @@ async function markTabActive(tabId) {
       title: tab.title,
       url: tab.url,
       favIconUrl: tab.favIconUrl,
+      wasActive: true,
+      windowId: tab.windowId,
     });
-    await maybeRestoreOnFocus(tab);
+    await maybeRestoreOnFocus(tab, restoreManual);
   } catch {
     // Tab may have disappeared.
   }
@@ -979,19 +1047,13 @@ async function performTabScan() {
 
       if (tab.active) {
         scheduleStuckSleepHeal(tab, settings);
-        if (shouldTreatYouTubeAsHighRisk(tab.url, state, settings)) {
-          await notifyOnce(
-            `youtube-risk-${tab.id}`,
-            'YouTube-вкладка тяжелеет',
-            `В этой вкладке уже ${state.youtubeVideoCount} переходов по видео. Когда закончишь, усыпи её через попап.`,
-          );
-        }
         continue;
       }
 
       const decision = buildSleepDecision({
         tab,
-        state,
+        // Cached page state can be stale after a pause, reload or form reset.
+        state: { ...state, dirty: false, mediaPlaying: false },
         settings,
         now: Date.now(),
         runtimeBaseUrl: RUNTIME_BASE_URL,
@@ -999,12 +1061,29 @@ async function performTabScan() {
       });
 
       if (decision.sleep) {
-        await sleepTab(tab, decision.reason, { settings });
+        const result = await sleepTab(tab, decision.reason, { settings });
+        await patchTabState(tab.id, { lastSleepCheck: { at: Date.now(), reason: result.reason } });
       }
     } catch {
       // A closed or restricted tab must not abort the rest of the scan.
     }
   }
+  await reconcileArchive(settings);
+}
+
+function reconcileArchive(settings) {
+  const operation = sleepQueue.then(async () => {
+    const tabs = await api.tabs.query({});
+    const activeTokens = tabs.map((tab) => extractKnownSleepToken(tab.url, settings)).filter(Boolean);
+    const sleepingTabs = await readObject(STORAGE_KEYS.sleepingTabs);
+    const entries = Object.values(sleepingTabs).filter((entry) => activeTokens.includes(entry.token));
+    return readLocalJson(settings, '/archive-entry', {
+      timeoutMs: 1500,
+      fetchOptions: { method: 'POST', body: JSON.stringify({ action: 'reconcile', activeTokens, entries }) },
+    });
+  });
+  sleepQueue = operation.catch(() => null);
+  return operation;
 }
 
 function runTabScan() {
@@ -1022,21 +1101,10 @@ async function sleepCurrentTab(hint = {}) {
   const baseSettings = await readSettings();
   const { tab } = await resolveCurrentTab(hint);
   if (tab?.id != null) {
-    return sleepTab(tab, 'manual-current-tab', { manual: true, settings: baseSettings });
+    return sleepTab(tab, 'manual-current-tab', { manual: true, allowActive: true, settings: baseSettings });
   }
 
-  const companionResult = await readLocalJson(baseSettings, '/sleep-current', {
-    timeoutMs: 9000,
-    fetchOptions: {
-      method: 'POST',
-      headers: companionMutationHeaders(),
-      body: '{}',
-    },
-  });
-  if (companionResult?.ok) {
-    return companionResult;
-  }
-  return { ok: false, reason: companionResult?.reason || 'missing-active-tab' };
+  return { ok: false, reason: 'missing-active-tab' };
 }
 
 async function sleepInactiveYouTubeTabs() {
@@ -1127,6 +1195,9 @@ async function readCurrentSleepingTabs(settings = null, knownOpenTabs = null) {
       resolvedSettings,
       RUNTIME_BASE_URL,
     );
+    for (const [token, entry] of Object.entries(sleepingTabs)) {
+      if (pendingTabSleeps.has(entry.tabId)) currentSleepingTabs[token] = entry;
+    }
     for (const token of Object.keys(sleepingTabs)) {
       delete sleepingTabs[token];
     }
@@ -1136,28 +1207,22 @@ async function readCurrentSleepingTabs(settings = null, knownOpenTabs = null) {
 }
 
 async function restoreAllSleepingTabs() {
-  const sleepingTabs = await readCurrentSleepingTabs();
+  const settings = await readSettings();
+  const tabs = await api.tabs.query({});
+  const sleepingTabs = await readCurrentSleepingTabs(settings, tabs);
+  const targets = new Map(tabs.map((tab) => [tab.id, extractKnownSleepToken(tab.url, settings)]));
+  for (const entry of Object.values(sleepingTabs)) {
+    if (!targets.get(entry.tabId)) targets.set(entry.tabId, entry.token);
+  }
   let restoredCount = 0;
   let skippedCount = 0;
 
-  for (const [token, entry] of Object.entries(sleepingTabs)) {
-    const restorableUrl = normalizeRestorableUrl(entry?.url);
-    if (entry?.tabId == null || !restorableUrl) {
-      skippedCount += 1;
-      continue;
-    }
-
+  for (const [tabId, token] of targets) {
+    if (!token) continue;
     try {
-      await api.tabs.update(entry.tabId, { url: restorableUrl });
-      await patchTabState(entry.tabId, {
-        lastActiveAt: Date.now(),
-        sleepToken: null,
-        restoredAt: Date.now(),
-      });
-      await mutateObject(STORAGE_KEYS.sleepingTabs, (currentSleepingTabs) => {
-        delete currentSleepingTabs[token];
-      });
-      restoredCount += 1;
+      const result = await restoreSleepingTab(tabId, token);
+      if (result.ok) restoredCount += 1;
+      else skippedCount += 1;
     } catch {
       skippedCount += 1;
     }
@@ -1167,16 +1232,17 @@ async function restoreAllSleepingTabs() {
 }
 
 async function toggleCurrentDomainInAllowlist(hint = {}) {
-  const settings = await readSettings();
   const { tab } = await resolveCurrentTab(hint);
   const host = hostnameFromUrl(tab?.url);
   if (!host) {
     return { ok: false, reason: 'missing-domain' };
   }
 
-  const result = toggleAllowlistForHost(settings.allowlist ?? [], host);
-
-  await writeSettings({ ...settings, allowlist: result.allowlist });
+  let result;
+  await writeSettings((settings) => {
+    result = toggleAllowlistForHost(settings.allowlist ?? [], host);
+    return { ...settings, allowlist: result.allowlist };
+  });
   return {
     ok: true,
     enabled: result.enabled,
@@ -1186,18 +1252,20 @@ async function toggleCurrentDomainInAllowlist(hint = {}) {
 }
 
 async function setCurrentDomainAllowlisted(hint = {}, enabled = true) {
-  const settings = await readSettings();
   const { tab } = await resolveCurrentTab(hint);
   const host = hostnameFromUrl(tab?.url);
   if (!host) {
     return { ok: false, reason: 'missing-domain' };
   }
 
-  const result = setAllowlistForHost(settings.allowlist ?? [], host, enabled);
+  let result;
+  await writeSettings((settings) => {
+    result = setAllowlistForHost(settings.allowlist ?? [], host, enabled);
+    return { ...settings, allowlist: result.allowlist };
+  });
   if (result.blockedByPattern) {
     return { ok: false, reason: 'covered-by-allowlist-pattern', enabled: true, domain: host };
   }
-  await writeSettings({ ...settings, allowlist: result.allowlist });
   return {
     ok: true,
     enabled: result.enabled,
@@ -1208,11 +1276,10 @@ async function setCurrentDomainAllowlisted(hint = {}, enabled = true) {
 
 async function setProfile(profile) {
   const profileSettings = applyProfile(profile);
-  const settings = await readSettings();
-  await writeSettings({
+  await writeSettings((settings) => ({
     ...settings,
     ...profileSettings,
-  });
+  }));
   return { ok: true, settings: await readSettings() };
 }
 
@@ -1221,7 +1288,7 @@ async function getPopupState(hint = {}) {
   const { tab, state } = await resolveCurrentTab(hint);
   const sleepingTabs = await readCurrentSleepingTabs(settings);
   const token = tab?.url ? extractKnownSleepToken(tab.url, settings) : null;
-  const sleepEntry = token ? sleepingTabs[token] : null;
+  const sleepEntry = token ? (sleepingTabs[token] ?? await readArchivedSleepEntry(settings, token)) : null;
   const effectiveUrl = sleepEntry?.url || tab?.url;
 
   return {
@@ -1234,6 +1301,7 @@ async function getPopupState(hint = {}) {
     reasonLabel: sleepEntry ? formatReason(sleepEntry.reason) : '',
     currentHost: hostnameFromUrl(effectiveUrl),
     sleepingTabs: sleepingTabsListFromStore(sleepingTabs),
+    hasSleepingTabs: (await api.tabs.query({})).some((candidate) => candidate.discarded || extractKnownSleepToken(candidate.url, settings)),
     activeTabDebug: {
       ...activeTabDebug,
       resolvedTabId: tab?.id ?? null,
@@ -1298,8 +1366,17 @@ api.alarms.onAlarm.addListener((alarm) => {
 });
 
 api.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  const previousTabId = activeTabsByWindow.get(windowId);
+  const deactivatedAt = Date.now();
   rememberActiveTab(tabId, windowId);
-  void markTabActive(tabId);
+  void mutateObject(STORAGE_KEYS.tabStates, (states) => {
+    for (const [id, state] of Object.entries(states)) {
+      if (Number(id) !== tabId && (Number(id) === previousTabId || (state.windowId === windowId && state.wasActive))) {
+        state.lastActiveAt = deactivatedAt;
+        state.wasActive = false;
+      }
+    }
+  }).then(() => markTabActive(tabId, true));
 });
 
 api.windows.onFocusChanged?.addListener(async (windowId) => {
@@ -1337,6 +1414,7 @@ async function handleRuntimeMessage(message, sender) {
   const tabId = sender?.tab?.id;
 
   if (message?.type === 'tab-sleeper:page-state' && tabId != null) {
+    if (sender.frameId != null && sender.frameId !== 0) return { ok: true };
     if (sender.tab?.active) {
       rememberActiveTab(tabId, sender.tab.windowId);
     }
@@ -1385,7 +1463,7 @@ async function handleRuntimeMessage(message, sender) {
   }
 
   if (message?.type === 'tab-sleeper:restore' && message.token) {
-    return restoreSleepingTab(message.tabId, message.token);
+    return restoreSleepingTab(tabId ?? message.tabId, message.token);
   }
 
   if (message?.type === 'tab-sleeper:restore-all') {

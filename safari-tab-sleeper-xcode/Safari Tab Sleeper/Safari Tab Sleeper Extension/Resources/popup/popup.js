@@ -2,11 +2,7 @@ import { runtimeApi as api, sendRuntimeMessage } from '../shared/messaging.js';
 import {
   hostnameFromUrl,
   isAllowlisted,
-  mergeSettings,
-  setAllowlistForHost,
 } from '../background/core.js';
-
-const SETTINGS_SCHEMA_VERSION = 2;
 
 const elements = {
   statusTitle: document.querySelector('#status-title'),
@@ -56,19 +52,28 @@ async function readActiveTabHint(fallbackState = currentState) {
   const fallback = activeTabHintFromState(fallbackState);
 
   try {
+    const window = await api.windows.getLastFocused({ populate: true });
+    const tab = window?.tabs?.find((candidate) => candidate.active);
+    if (tab?.id != null) return { currentTabId: tab.id, currentUrl: tab.url, currentTitle: tab.title };
+  } catch {
+    // Safari may withhold window details from the popup.
+  }
+
+  try {
     const companionTab = await readCompanionActiveTab(fallbackState?.settings);
     if (companionTab?.url) {
       let matchingTab = null;
       try {
         const tabs = await api.tabs.query({});
         const matchingTabs = tabs.filter((candidate) => candidate.url === companionTab.url);
-        matchingTab = matchingTabs.find((candidate) => candidate.active)
-          || (matchingTabs.length === 1 ? matchingTabs[0] : null);
+        const activeMatches = matchingTabs.filter((candidate) => candidate.active);
+        matchingTab = activeMatches.length === 1 ? activeMatches[0]
+          : (matchingTabs.length === 1 ? matchingTabs[0] : null);
       } catch {
         // The URL from the front Safari window is still authoritative for the switch.
       }
 
-      return {
+      if (matchingTab) return {
         currentTabId: matchingTab?.id,
         currentUrl: companionTab.url,
         currentTitle: companionTab.title || matchingTab?.title || fallback.currentTitle,
@@ -160,43 +165,6 @@ async function readCompanionActiveTab(settings = {}) {
   return result?.ok && hostnameFromUrl(result.url) ? result : null;
 }
 
-async function readStoredSettings(fallback = {}) {
-  try {
-    const stored = await api.storage.local.get('settings');
-    return mergeSettings(stored.settings ?? fallback);
-  } catch {
-    return mergeSettings(fallback);
-  }
-}
-
-async function enrichPopupState(state) {
-  const [hint, settings] = await Promise.all([
-    readActiveTabHint(state),
-    readStoredSettings(state.settings),
-  ]);
-  const hintedUrl = hint.currentUrl || '';
-  const currentHost = hostnameFromUrl(hintedUrl) || state.currentHost;
-  if (!currentHost) {
-    return { ...state, settings };
-  }
-
-  return {
-    ...state,
-    settings,
-    currentHost,
-    tab: {
-      ...(state.tab ?? {}),
-      id: hint.currentTabId ?? state.tab?.id,
-      url: hintedUrl || state.tab?.url,
-      title: hint.currentTitle || state.tab?.title || hintedUrl,
-    },
-    activeTabDebug: {
-      ...(state.activeTabDebug ?? {}),
-      source: hint.source || state.activeTabDebug?.source || 'popup',
-    },
-  };
-}
-
 async function setCurrentSiteAllowlisted(enabled) {
   const hint = await readActiveTabHint();
   const host = hostnameFromUrl(hint.currentUrl || currentState?.tab?.url);
@@ -204,25 +172,10 @@ async function setCurrentSiteAllowlisted(enabled) {
     return { ok: false, reason: 'missing-domain' };
   }
 
-  const settings = await readStoredSettings(currentState?.settings);
-  try {
-    const workerResult = await send('tab-sleeper:set-allowlist-current', { ...hint, enabled });
-    if (workerResult?.ok === false) {
-      return workerResult;
-    }
-    const nextSettings = mergeSettings(workerResult?.settings ?? settings);
-    currentState = { ...currentState, settings: nextSettings, currentHost: host };
-    return { ok: true, enabled: workerResult.enabled, domain: host };
-  } catch {
-    const result = setAllowlistForHost(settings.allowlist ?? [], host, enabled);
-    if (result.blockedByPattern) {
-      return { ok: false, reason: 'covered-by-allowlist-pattern' };
-    }
-    const nextSettings = mergeSettings({ ...settings, allowlist: result.allowlist });
-    await api.storage.local.set({ settings: nextSettings, settingsSchemaVersion: SETTINGS_SCHEMA_VERSION });
-    currentState = { ...currentState, settings: nextSettings, currentHost: host };
-    return { ok: true, enabled: result.enabled, domain: host };
-  }
+  const workerResult = await send('tab-sleeper:set-allowlist-current', { ...hint, enabled });
+  if (workerResult?.ok !== true) return workerResult ?? { ok: false, reason: 'worker-unavailable' };
+  currentState = { ...currentState, settings: workerResult.settings, currentHost: host };
+  return { ok: true, enabled: workerResult.enabled, domain: host };
 }
 
 async function updateAllowlistToggle(enabled) {
@@ -263,7 +216,7 @@ async function sleepCurrentWithFallback() {
 function renderMemoryStatus(status) {
   if (!status?.ok) {
     elements.memoryUsage.textContent = 'Недоступно';
-    elements.memoryDetails.textContent = 'Локальный companion-монитор не ответил.';
+    elements.memoryDetails.textContent = 'Локальный монитор памяти не ответил.';
     return;
   }
 
@@ -311,10 +264,10 @@ function render(state) {
   elements.sleepAllExceptCurrent.disabled = false;
   elements.sleepYouTube.disabled = false;
   elements.freeMemoryNow.disabled = false;
-  elements.restoreAll.disabled = sleepingCount === 0;
+  elements.restoreAll.disabled = !state.hasSleepingTabs && sleepingCount === 0;
   elements.profile.disabled = false;
   elements.resetYouTube.disabled = youtubeCount === 0;
-  elements.allowlistToggle.disabled = state.isSleeping;
+  elements.allowlistToggle.disabled = state.isSleeping || !state.currentHost;
   setAllowlistToggleValue(isCurrentHostAllowlisted(state));
   renderPowerStatus(state.powerStatus);
 }
@@ -322,7 +275,8 @@ function render(state) {
 async function refresh() {
   try {
     const backgroundState = await send('tab-sleeper:get-popup-state', await readActiveTabHint());
-    const state = await enrichPopupState(backgroundState);
+    if (!backgroundState?.settings) throw new Error('Расширение не передало состояние.');
+    const state = backgroundState;
     render(state);
     const [memoryResult, powerResult] = await Promise.allSettled([
       readMemoryStatus(state.settings),
@@ -373,7 +327,14 @@ function formatActionReason(reason) {
     'tab-changed': 'вкладка успела перейти на другую страницу',
     'covered-by-allowlist-pattern': 'сайт защищён общим шаблоном в настройках',
     'missing-active-tab': 'Safari не передал активную вкладку',
-    'sleep-server-unavailable': 'локальный companion недоступен',
+    'sleep-server-unavailable': 'локальный сервис восстановления недоступен',
+    'archive-unavailable': 'не удалось сохранить адрес для восстановления',
+    'active-tab': 'вкладка сейчас выбрана',
+    'pinned-tab': 'вкладка закреплена',
+    'audible-tab': 'на вкладке воспроизводится аудио или видео',
+    'single-media-tab': 'это единственная вкладка сайта с воспроизведением',
+    'loading-tab': 'страница ещё загружается',
+    'worker-unavailable': 'фоновая часть расширения не ответила',
     'unsupported-url': 'эту страницу нельзя усыпить',
   };
   return labels[reason] || String(reason || 'неизвестная причина');

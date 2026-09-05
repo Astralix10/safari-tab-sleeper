@@ -329,7 +329,7 @@ export function reconcileSleepingTabsWithOpenTabs(
 }
 
 export function shouldHealStuckSleepTab({ tab, settings = DEFAULT_SETTINGS, runtimeBaseUrl = '' }) {
-  if (!tab?.active || !tab.url) {
+  if (!settings.restoreOnFocus || !tab?.active || !tab.url) {
     return false;
   }
 
@@ -472,6 +472,11 @@ function parseHttpUrl(value) {
 
 export function normalizeRestorableUrl(value) {
   const unwrappedValue = unwrapNestedSleepUrl(value);
+  try {
+    if (isKnownSleepWrapper(new URL(unwrappedValue))) return '';
+  } catch {
+    // Reader URLs are normalized below.
+  }
   const directUrl = parseHttpUrl(unwrappedValue);
   if (directUrl) {
     return directUrl;
@@ -714,8 +719,16 @@ export function getTabEligibility({ tab, state = {}, settings = DEFAULT_SETTINGS
     return { eligible: false, reason: 'pinned-tab' };
   }
 
-  if (settings.skipAudible && tab.audible) {
+  if (settings.skipAudible && (tab.audible || state.mediaPlaying)) {
     return { eligible: false, reason: 'audible-tab' };
+  }
+
+  if (tab.discarded) {
+    return { eligible: false, reason: 'already-sleeping' };
+  }
+
+  if (tab.status === 'loading') {
+    return { eligible: false, reason: 'loading-tab' };
   }
 
   if (isKnownSleepPageUrl(tab.url, settings, runtimeBaseUrl)) {
@@ -789,10 +802,11 @@ export function setAllowlistForHost(allowlist = [], host = '', enabled = true) {
       return { enabled: true, allowlist: normalizedAllowlist, blockedByPattern: true };
     }
     const exactSet = new Set(exactEntries);
-    return {
-      enabled: false,
-      allowlist: normalizedAllowlist.filter((entry) => !exactSet.has(entry)),
-    };
+    const remaining = normalizedAllowlist.filter((entry) => !exactSet.has(entry));
+    if (isAllowlisted(targetUrl, remaining)) {
+      return { enabled: true, allowlist: normalizedAllowlist, blockedByPattern: true };
+    }
+    return { enabled: false, allowlist: remaining };
   }
 
   const nextAllowlist = Array.from(new Set([...normalizedAllowlist, normalizedHost])).sort();

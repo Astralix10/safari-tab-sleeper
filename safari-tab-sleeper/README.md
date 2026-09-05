@@ -11,7 +11,7 @@ It targets the annoying case where long-lived tabs, especially YouTube, keep lar
 - Keeps the selected inactivity timer stable while tuning only heavy-tab cleanup for battery or power.
 - Restores sleeping tabs automatically when selected.
 - Retries restore for active sleep pages that get stuck.
-- Keeps the original tab title and favicon visible with `[sleep]` prefixes.
+- Keeps the original tab title with a `[sleep]` prefix and reuses embedded favicon data when available.
 - Skips active, pinned, audible, dirty-form, internal, and allowlisted tabs.
 - Syncs allowlisted sites to the local companion so forced memory cleanup does not sleep protected sites such as YouTube.
 - Treats YouTube allowlisting as a site family, covering `youtube.com`, subdomains, `youtu.be`, and embed/nocookie hosts.
@@ -57,35 +57,21 @@ The Xcode Safari App Extension wrapper lives in the sibling project:
 
 ## Build The Safari App
 
-Generate or reuse the local companion token before building. The generated JavaScript file is ignored by Git:
+From this directory, use the shared Xcode entrypoint:
 
 ```zsh
-./companion/install-launch-agent.zsh
+../script/build_and_run.sh
 ```
 
-Release build:
+The script reuses the local companion token, synchronizes extension resources, builds Release, verifies the signature, updates the same installed bundle, installs the companion, and launches the app. The generated token file is ignored by Git. Configure your own signing team in Xcode before the first build.
+
+Build without installing:
 
 ```zsh
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-xcodebuild -project "../safari-tab-sleeper-xcode/Safari Tab Sleeper/Safari Tab Sleeper.xcodeproj" \
-  -scheme "Safari Tab Sleeper" \
-  -configuration Release \
-  -derivedDataPath "../safari-tab-sleeper-xcode/DerivedData-Release" \
-  build
+../script/build_and_run.sh --build-only
 ```
 
-Install locally:
-
-```zsh
-rm -rf "$HOME/Applications/Safari Tab Sleeper.app"
-ditto "../safari-tab-sleeper-xcode/DerivedData-Release/Build/Products/Release/Safari Tab Sleeper.app" \
-  "$HOME/Applications/Safari Tab Sleeper.app"
-
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-  -f "$HOME/Applications/Safari Tab Sleeper.app"
-```
-
-Open the app once, then enable Safari Tab Sleeper in Safari Settings -> Extensions.
+The installed app is at `~/Applications/Safari Tab Sleeper.app`. Enable it once in Safari Settings -> Extensions. Restart Safari after an update to load the new worker; the script does not close browser windows automatically.
 
 ## Run The Companion
 
@@ -121,7 +107,7 @@ Useful endpoints:
 - `/power`: battery or power-adapter status.
 - `/extension-state`: recent background-worker heartbeat used when SafariServices cannot report extension state.
 - `/settings`: synced allowlist used by companion AppleScript cleanup.
-- `/sleep-current`: sleeps the actual front Safari tab through the local companion.
+- `/sleep-current`: returns `extension-required`; current-tab sleeping must pass the extension's live protection checks.
 - `/sleep`: lightweight sleep page.
 - `/archive-entry`: local backup store for sleeping-tab restore data.
 
@@ -151,7 +137,7 @@ npm run build:menubar
 
 ## Release 0.3.10
 
-- Makes the aggressive profile sleep ordinary inactive tabs after exactly five minutes, including while the Mac is charging.
+- Makes the aggressive profile eligible to sleep ordinary inactive tabs after five minutes, including while the Mac is charging. The next minute scan performs the operation.
 - Detects playing audio and video in the page, including muted video, and protects the only media tab for a domain.
 - Lets aggressive cleanup unload an inactive media tab only when another tab for the same domain is open.
 - Runs the injected page-state fallback when old Safari tabs return no content-script response instead of an error.

@@ -1,10 +1,10 @@
 {
   "name": "safari-tab-sleeper",
-  "version": "0.3.10",
+  "version": "0.3.11",
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/*.test.mjs",
+    "test": "node --experimental-vm-modules --test tests/*.test.mjs",
     "check:scripts": "zsh -n companion/memory-guard.zsh && python3 -m py_compile companion/sleeper-server.py && osacompile -o /tmp/safari-tab-sleeper-reload.scpt companion/reload-current-tab.applescript && osacompile -o /tmp/safari-tab-sleeper-sleep.scpt companion/sleep-current-tab.applescript && osacompile -o /tmp/safari-tab-sleeper-youtube.scpt companion/sleep-inactive-youtube-tabs.applescript && osacompile -o /tmp/safari-tab-sleeper-all-inactive.scpt companion/sleep-all-inactive-tabs.applescript",
     "build:menubar": "swift build -c release --package-path menubar"
   }

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.11
+
+- Revalidate tab identity, active/pinned state, forms, media and current site protection immediately before sleep or restore.
+- Durably prepare recovery records and roll them back when navigation fails.
+- Preserve every live recovery token across duplicate compaction, limits and server restarts; restore all actual sleeping tabs after storage loss.
+- Start inactivity at deactivation and refresh stale media state, including accessible embedded frames.
+- Serialize settings edits, respect restore settings, and prevent watchdogs from immediately undoing manual sleep.
+- Bound page requests and concurrent HTTP connections, reduce unchanged writes, and fix host status races.
+- Authenticate privileged Safari GET requests when the browser omits Origin, restoring memory/power readings and cleanup polling without accepting ordinary website origins.
+- Add executable worker integration tests and a repeatable Xcode build/install entrypoint.
+
 ## 0.2.0
 
 - Fixed YouTube-family allowlist toggling and companion synchronization.

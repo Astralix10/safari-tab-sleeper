@@ -5,7 +5,7 @@ import {
   getSleepingTabIconUrl,
   normalizeRestorableUrl,
 } from '../background/core.js';
-import { runtimeApi as api, sendRuntimeMessage } from '../shared/messaging.js';
+import { sendRuntimeMessage } from '../shared/messaging.js';
 
 const params = new URLSearchParams(location.search);
 const token = params.get('token');
@@ -88,11 +88,7 @@ async function restoreNow() {
   restore.textContent = 'Восстанавливаю...';
   let result = null;
   try {
-    const [tab] = await api.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id == null) {
-      throw new Error('missing-active-tab');
-    }
-    result = await send('tab-sleeper:restore', { token, tabId: tab.id });
+    result = await send('tab-sleeper:restore', { token });
   } catch {
     result = { ok: false, reason: 'message-failed' };
   }
@@ -110,12 +106,14 @@ async function restoreNow() {
 }
 
 function scheduleAutoRestore() {
-  if (!activeEntry || document.visibilityState !== 'visible') {
+  if (!activeEntry || activeEntry.restoreOnFocus === false || document.visibilityState !== 'visible') {
     return;
   }
 
   if (activeEntry.reason === 'manual-current-tab' && wasHiddenAfterSleep) {
-    window.setTimeout(restoreNow, 150);
+    window.setTimeout(() => {
+      if (document.visibilityState === 'visible') restoreNow();
+    }, 150);
     return;
   }
 
