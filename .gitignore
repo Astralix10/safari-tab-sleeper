@@ -20,3 +20,7 @@ sleep-archive.json
 pause-until
 *.log
 *.err.log
+
+# Generated companion secret
+safari-tab-sleeper/extension/shared/companion-token.js
+safari-tab-sleeper-xcode/Safari Tab Sleeper/Safari Tab Sleeper Extension/Resources/shared/companion-token.js

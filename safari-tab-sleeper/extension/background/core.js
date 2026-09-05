@@ -35,6 +35,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
   ],
 });
 
+const SETTINGS_LIMITS = Object.freeze({
+  inactivityMinutes: Object.freeze({ min: 1, max: 180 }),
+  youtubeVideoThreshold: Object.freeze({ min: 2, max: 500 }),
+  youtubeHighRiskInactiveSeconds: Object.freeze({ min: 10, max: 1800 }),
+  aggressiveInactiveSeconds: Object.freeze({ min: 10, max: 1800 }),
+});
+
 const PROFILE_SETTINGS = Object.freeze({
   safe: Object.freeze({
     profile: 'safe',
@@ -50,7 +57,7 @@ const PROFILE_SETTINGS = Object.freeze({
   }),
   aggressive: Object.freeze({
     profile: 'aggressive',
-    inactivityMinutes: 1,
+    inactivityMinutes: 5,
     youtubeHighRiskInactiveSeconds: 20,
     skipAudible: false,
   }),
@@ -70,15 +77,72 @@ const INTERNAL_PROTOCOLS = new Set([
 const YOUTUBE_FAMILY_DOMAINS = ['youtube.com', 'youtu.be', 'youtube-nocookie.com'];
 
 export function mergeSettings(settings = {}) {
-  const profileDefaults = applyProfile(settings.profile ?? DEFAULT_SETTINGS.profile);
+  const profile = Object.hasOwn(PROFILE_SETTINGS, settings.profile)
+    ? settings.profile
+    : DEFAULT_SETTINGS.profile;
+  const profileDefaults = applyProfile(profile);
+  const defaults = { ...DEFAULT_SETTINGS, ...profileDefaults };
+
   return {
-    ...DEFAULT_SETTINGS,
-    ...profileDefaults,
-    ...settings,
+    profile,
+    inactivityMinutes: profile === 'aggressive'
+      ? PROFILE_SETTINGS.aggressive.inactivityMinutes
+      : clampSettingNumber(settings.inactivityMinutes, defaults.inactivityMinutes, SETTINGS_LIMITS.inactivityMinutes),
+    youtubeVideoThreshold: clampSettingNumber(settings.youtubeVideoThreshold, defaults.youtubeVideoThreshold, SETTINGS_LIMITS.youtubeVideoThreshold),
+    youtubeHighRiskInactiveSeconds: clampSettingNumber(
+      settings.youtubeHighRiskInactiveSeconds,
+      defaults.youtubeHighRiskInactiveSeconds,
+      SETTINGS_LIMITS.youtubeHighRiskInactiveSeconds,
+    ),
+    aggressiveInactiveSeconds: clampSettingNumber(
+      settings.aggressiveInactiveSeconds,
+      defaults.aggressiveInactiveSeconds,
+      SETTINGS_LIMITS.aggressiveInactiveSeconds,
+    ),
+    sleepServerUrl: normalizeSleepServerUrl(settings.sleepServerUrl, defaults.sleepServerUrl),
+    requireLocalSleepServer: settingBoolean(settings.requireLocalSleepServer, defaults.requireLocalSleepServer),
+    restoreOnFocus: settingBoolean(settings.restoreOnFocus, defaults.restoreOnFocus),
+    powerAware: settingBoolean(settings.powerAware, defaults.powerAware),
+    skipPinned: settingBoolean(settings.skipPinned, defaults.skipPinned),
+    skipAudible: settingBoolean(settings.skipAudible, defaults.skipAudible),
+    protectDirtyForms: settingBoolean(settings.protectDirtyForms, defaults.protectDirtyForms),
     allowlist: normalizeAllowlist(settings.allowlist ?? DEFAULT_SETTINGS.allowlist),
     aggressiveList: normalizeAllowlist(settings.aggressiveList ?? DEFAULT_SETTINGS.aggressiveList),
     pressureDomains: normalizeAllowlist(settings.pressureDomains ?? DEFAULT_SETTINGS.pressureDomains),
   };
+}
+
+function clampSettingNumber(value, fallback, limits) {
+  if (value === '' || value === null || value === undefined) {
+    return fallback;
+  }
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) {
+    return fallback;
+  }
+  return Math.min(limits.max, Math.max(limits.min, numericValue));
+}
+
+function settingBoolean(value, fallback) {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function normalizeSleepServerUrl(value, fallback) {
+  try {
+    const parsed = new URL(String(value || fallback));
+    if (
+      (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+      && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')
+    ) {
+      parsed.pathname = '/sleep';
+      parsed.search = '';
+      parsed.hash = '';
+      return parsed.toString();
+    }
+  } catch {
+    // Fall through to the known-safe localhost endpoint.
+  }
+  return fallback;
 }
 
 export function applyProfile(profile) {
@@ -95,7 +159,6 @@ export function applyPowerMode(settings = DEFAULT_SETTINGS, powerStatus = {}) {
     return {
       ...normalizedSettings,
       powerMode: 'battery',
-      inactivityMinutes: Math.min(Number(normalizedSettings.inactivityMinutes), 3),
       youtubeHighRiskInactiveSeconds: Math.min(Number(normalizedSettings.youtubeHighRiskInactiveSeconds), 45),
       aggressiveInactiveSeconds: Math.min(Number(normalizedSettings.aggressiveInactiveSeconds), 45),
     };
@@ -105,7 +168,6 @@ export function applyPowerMode(settings = DEFAULT_SETTINGS, powerStatus = {}) {
     return {
       ...normalizedSettings,
       powerMode: 'power',
-      inactivityMinutes: Math.max(Number(normalizedSettings.inactivityMinutes), 10),
       youtubeHighRiskInactiveSeconds: Math.max(Number(normalizedSettings.youtubeHighRiskInactiveSeconds), 120),
       aggressiveInactiveSeconds: Math.max(Number(normalizedSettings.aggressiveInactiveSeconds), 120),
     };
@@ -117,7 +179,7 @@ export function applyPowerMode(settings = DEFAULT_SETTINGS, powerStatus = {}) {
 export function normalizeAllowlist(value) {
   const lines = Array.isArray(value) ? value : String(value ?? '').split(/\r?\n/);
 
-  return lines
+  return Array.from(new Set(lines
     .map((line) => String(line).trim())
     .filter((line) => line && !line.startsWith('#'))
     .map((line) => line.replace(/\s+#.*$/, '').trim())
@@ -136,23 +198,18 @@ export function normalizeAllowlist(value) {
           .toLowerCase();
       }
     })
-    .filter(Boolean);
+    .filter(Boolean)));
 }
 
-export function buildSleepPageUrl(runtimeBaseUrl, token, fallbackEntry = null) {
+export function buildSleepPageUrl(runtimeBaseUrl, token) {
   const url = new URL('sleep/sleep.html', runtimeBaseUrl);
   url.searchParams.set('token', token);
-
-  if (fallbackEntry) {
-    url.hash = encodeSleepFallback(fallbackEntry).replace(/^#/, '');
-  }
-
   return url.toString();
 }
 
-export function buildLocalSleepPageUrl(serverUrl, fallbackEntry) {
+export function buildLocalSleepPageUrl(serverUrl, token) {
   const url = new URL(serverUrl);
-  url.hash = encodeSleepFallback(fallbackEntry).replace(/^#/, '');
+  url.hash = new URLSearchParams({ token: String(token || '') }).toString();
   return url.toString();
 }
 
@@ -160,7 +217,7 @@ export function isLocalSleepPageUrl(candidateUrl, serverUrl = DEFAULT_SETTINGS.s
   try {
     const sleepUrl = new URL(serverUrl);
     const candidate = new URL(candidateUrl);
-    return candidate.origin === sleepUrl.origin && candidate.pathname === sleepUrl.pathname;
+    return urlsHaveSameAuthority(candidate, sleepUrl) && candidate.pathname === sleepUrl.pathname;
   } catch {
     return false;
   }
@@ -170,10 +227,22 @@ export function isSleepPageUrl(candidateUrl, runtimeBaseUrl) {
   try {
     const sleepUrl = new URL('sleep/sleep.html', runtimeBaseUrl);
     const candidate = new URL(candidateUrl);
-    return candidate.origin === sleepUrl.origin && candidate.pathname === sleepUrl.pathname;
+    return urlsHaveSameAuthority(candidate, sleepUrl) && candidate.pathname === sleepUrl.pathname;
   } catch {
     return false;
   }
+}
+
+export function isKnownSleepPageUrl(candidateUrl, settings = DEFAULT_SETTINGS, runtimeBaseUrl = '') {
+  const normalizedSettings = mergeSettings(settings);
+  return isLocalSleepPageUrl(candidateUrl, normalizedSettings.sleepServerUrl)
+    || Boolean(runtimeBaseUrl && isSleepPageUrl(candidateUrl, runtimeBaseUrl));
+}
+
+function urlsHaveSameAuthority(left, right) {
+  return left.protocol === right.protocol
+    && left.hostname === right.hostname
+    && left.port === right.port;
 }
 
 export function extractSleepToken(candidateUrl, runtimeBaseUrl) {
@@ -194,7 +263,9 @@ export function extractLocalSleepToken(candidateUrl, serverUrl = DEFAULT_SETTING
   }
 
   try {
-    return decodeSleepFallback(new URL(candidateUrl).hash)?.token ?? null;
+    const candidate = new URL(candidateUrl);
+    const hash = new URLSearchParams(candidate.hash.replace(/^#/, ''));
+    return hash.get('token') || decodeSleepFallback(candidate.hash)?.token || null;
   } catch {
     return null;
   }
@@ -225,7 +296,8 @@ export function reconcileSleepingTabsWithOpenTabs(
 
   const nextSleepingTabs = {};
   for (const [storageToken, entry] of Object.entries(sleepingTabs ?? {})) {
-    if (!entry?.url) {
+    const entryUrl = normalizeRestorableUrl(entry?.url);
+    if (!entryUrl) {
       continue;
     }
 
@@ -236,18 +308,19 @@ export function reconcileSleepingTabsWithOpenTabs(
         ...entry,
         token,
         tabId: sleepPageTab.id,
+        url: entryUrl,
       };
       continue;
     }
 
     const matchingTab = tabsById.get(Number(entry.tabId));
     const tabUrl = normalizeRestorableUrl(matchingTab?.url);
-    const entryUrl = normalizeRestorableUrl(entry.url);
     if (matchingTab?.discarded === true && tabUrl && tabUrl === entryUrl) {
       nextSleepingTabs[storageToken] = {
         ...entry,
         token,
         tabId: matchingTab.id,
+        url: entryUrl,
       };
     }
   }
@@ -256,7 +329,7 @@ export function reconcileSleepingTabsWithOpenTabs(
 }
 
 export function shouldHealStuckSleepTab({ tab, settings = DEFAULT_SETTINGS, runtimeBaseUrl = '' }) {
-  if (!tab?.active || !tab.url) {
+  if (!settings.restoreOnFocus || !tab?.active || !tab.url) {
     return false;
   }
 
@@ -362,26 +435,16 @@ export function shouldAutoRestoreSleepPage({ entry, now = Date.now(), minimumSle
 
 export function getSleepingTabIconUrl({ pageUrl, favIconUrl = '' }) {
   const explicitIcon = String(favIconUrl || '').trim();
-  if (isHttpUrl(explicitIcon)) {
+  if (isEmbeddedIconUrl(explicitIcon)) {
     return explicitIcon;
   }
-
-  try {
-    const parsed = new URL(normalizeRestorableUrl(pageUrl) || pageUrl);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return '';
-    }
-
-    return `${parsed.origin}/favicon.ico`;
-  } catch {
-    return '';
-  }
+  return '';
 }
 
-function isHttpUrl(value) {
+function isEmbeddedIconUrl(value) {
   try {
     const parsed = new URL(value);
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    return parsed.protocol === 'data:' || parsed.protocol === 'blob:';
   } catch {
     return false;
   }
@@ -407,55 +470,91 @@ function parseHttpUrl(value) {
   return '';
 }
 
-function collectReaderCandidates(value) {
-  const candidates = [];
-  const add = (candidate) => {
-    const text = String(candidate || '').trim();
-    if (text && !candidates.includes(text)) {
-      candidates.push(text);
-    }
-  };
-
-  add(value);
-
-  let decoded = String(value || '').trim();
-  for (let i = 0; i < 3; i += 1) {
-    const next = decodeURIComponentSafely(decoded);
-    if (next === decoded) {
-      break;
-    }
-    decoded = next;
-    add(decoded);
+export function normalizeRestorableUrl(value) {
+  const unwrappedValue = unwrapNestedSleepUrl(value);
+  try {
+    if (isKnownSleepWrapper(new URL(unwrappedValue))) return '';
+  } catch {
+    // Reader URLs are normalized below.
   }
-
-  for (const candidate of [...candidates]) {
-    try {
-      const parsed = new URL(candidate);
-      for (const key of ['url', 'u', 'target']) {
-        add(parsed.searchParams.get(key));
-      }
-    } catch {
-      // Reader-like URLs are often malformed for the URL parser after decoding.
-    }
-
-    const matches = candidate.match(/https?:\/\/[^\s"'<>]+/gi) || [];
-    for (const match of matches) {
-      add(match.replace(/[),.;]+$/, ''));
-    }
+  const directUrl = parseHttpUrl(unwrappedValue);
+  if (directUrl) {
+    return directUrl;
   }
-
-  return candidates;
+  return parseSupportedReaderUrl(unwrappedValue);
 }
 
-export function normalizeRestorableUrl(value) {
-  for (const candidate of collectReaderCandidates(value)) {
-    const restorable = parseHttpUrl(candidate);
-    if (restorable) {
-      return restorable;
+function parseSupportedReaderUrl(value) {
+  const text = String(value || '').trim();
+  if (text.startsWith('about:reader?')) {
+    try {
+      return parseHttpUrl(new URL(text).searchParams.get('url'));
+    } catch {
+      return '';
+    }
+  }
+
+  for (const prefix of ['x-safari-reader://', 'safari-reader://']) {
+    if (text.toLowerCase().startsWith(prefix)) {
+      return parseHttpUrl(decodeURIComponentSafely(text.slice(prefix.length)));
     }
   }
 
   return '';
+}
+
+function unwrapNestedSleepUrl(value) {
+  let current = String(value || '').trim();
+  const seen = new Set();
+
+  for (let depth = 0; depth < 8 && current && !seen.has(current); depth += 1) {
+    seen.add(current);
+    const next = unwrapKnownSleepUrl(current);
+    if (!next || next === current) {
+      break;
+    }
+    current = String(next).trim();
+  }
+
+  return current;
+}
+
+function unwrapKnownSleepUrl(value) {
+  try {
+    const parsed = new URL(value);
+    if (!isKnownSleepWrapper(parsed)) {
+      return '';
+    }
+
+    const hash = new URLSearchParams(parsed.hash.replace(/^#/, ''));
+    const legacyUrl = hash.get('url');
+    if (legacyUrl) {
+      return legacyUrl;
+    }
+
+    const fallback = hash.get('fallback');
+    if (!fallback) {
+      return '';
+    }
+
+    return JSON.parse(base64UrlDecode(fallback))?.url || '';
+  } catch {
+    return '';
+  }
+}
+
+function isKnownSleepWrapper(parsed) {
+  const protocol = parsed.protocol.toLowerCase();
+  const pathname = parsed.pathname.toLowerCase();
+  const host = parsed.hostname.toLowerCase();
+
+  if (protocol === 'file:' && pathname.endsWith('/local-sleeper.html')) {
+    return true;
+  }
+  if ((host === '127.0.0.1' || host === 'localhost') && pathname === '/sleep') {
+    return true;
+  }
+  return false;
 }
 
 function base64UrlEncode(value) {
@@ -500,15 +599,54 @@ export function shouldTreatYouTubeAsHighRisk(url, state = {}, settings = DEFAULT
   return isYouTubeUrl(url) && Number(state.youtubeVideoCount ?? 0) >= Number(settings.youtubeVideoThreshold ?? 20);
 }
 
+export function mergeYouTubePageState(existingState = {}, incomingState = {}) {
+  const previousNumericCount = Number(existingState.youtubeVideoCount ?? 0);
+  const previousCount = Number.isFinite(previousNumericCount) ? Math.max(0, previousNumericCount) : 0;
+  const previousUrl = String(existingState.youtubeLastVideoUrl || '');
+  const incomingNumericCount = Number(incomingState.youtubeVideoCount ?? 0);
+  const incomingCount = Number.isFinite(incomingNumericCount) ? Math.max(0, incomingNumericCount) : 0;
+  const incomingUrl = String(incomingState.youtubeLastVideoUrl || '');
+
+  if (!incomingUrl) {
+    return {
+      youtubeVideoCount: previousCount,
+      youtubeLastVideoUrl: previousUrl,
+    };
+  }
+
+  if (incomingUrl === previousUrl) {
+    return {
+      youtubeVideoCount: previousCount,
+      youtubeLastVideoUrl: previousUrl,
+    };
+  }
+
+  return {
+    youtubeVideoCount: Math.max(previousCount + 1, incomingCount),
+    youtubeLastVideoUrl: incomingUrl,
+  };
+}
+
 export function isAggressiveDomain(url, settings = DEFAULT_SETTINGS) {
   return isDomainMatched(url, settings.aggressiveList ?? []);
 }
 
 export function isPressureDomain(url, settings = DEFAULT_SETTINGS) {
-  return isDomainMatched(url, settings.pressureDomains ?? DEFAULT_SETTINGS.pressureDomains);
+  const normalizedSettings = mergeSettings(settings);
+  if (isLocalSleepPageUrl(url, normalizedSettings.sleepServerUrl)) {
+    return false;
+  }
+  return isDomainMatched(url, normalizedSettings.pressureDomains);
 }
 
-export function buildSleepDecision({ tab, state = {}, settings = DEFAULT_SETTINGS, now = Date.now(), runtimeBaseUrl = '' }) {
+export function buildSleepDecision({
+  tab,
+  state = {},
+  settings = DEFAULT_SETTINGS,
+  now = Date.now(),
+  runtimeBaseUrl = '',
+  sameDomainTabCount = 1,
+}) {
   const normalizedSettings = mergeSettings(settings);
   const eligibility = getTabEligibility({ tab, state, settings: normalizedSettings, runtimeBaseUrl, allowActive: false });
 
@@ -516,8 +654,20 @@ export function buildSleepDecision({ tab, state = {}, settings = DEFAULT_SETTING
     return { sleep: false, reason: eligibility.reason };
   }
 
+  const mediaPlaying = Boolean(tab.audible || state.mediaPlaying);
+  if (mediaPlaying && Math.max(1, Number(sameDomainTabCount) || 1) === 1) {
+    return { sleep: false, reason: 'single-media-tab' };
+  }
+
   const lastActiveAt = Number(state.lastActiveAt ?? now);
   const inactiveMs = Math.max(0, now - lastActiveAt);
+  const inactivityMs = Number(normalizedSettings.inactivityMinutes) * 60_000;
+
+  if (normalizedSettings.profile === 'aggressive') {
+    return inactiveMs >= inactivityMs
+      ? { sleep: true, reason: 'inactive-timeout' }
+      : { sleep: false, reason: 'not-idle-long-enough' };
+  }
 
   if (shouldTreatYouTubeAsHighRisk(tab.url, state, normalizedSettings)) {
     const youtubeTimeoutMs = Number(normalizedSettings.youtubeHighRiskInactiveSeconds) * 1000;
@@ -533,7 +683,6 @@ export function buildSleepDecision({ tab, state = {}, settings = DEFAULT_SETTING
     }
   }
 
-  const inactivityMs = Number(normalizedSettings.inactivityMinutes) * 60_000;
   if (inactiveMs >= inactivityMs) {
     return { sleep: true, reason: 'inactive-timeout' };
   }
@@ -570,11 +719,19 @@ export function getTabEligibility({ tab, state = {}, settings = DEFAULT_SETTINGS
     return { eligible: false, reason: 'pinned-tab' };
   }
 
-  if (settings.skipAudible && tab.audible) {
+  if (settings.skipAudible && (tab.audible || state.mediaPlaying)) {
     return { eligible: false, reason: 'audible-tab' };
   }
 
-  if (runtimeBaseUrl && isSleepPageUrl(tab.url, runtimeBaseUrl)) {
+  if (tab.discarded) {
+    return { eligible: false, reason: 'already-sleeping' };
+  }
+
+  if (tab.status === 'loading') {
+    return { eligible: false, reason: 'loading-tab' };
+  }
+
+  if (isKnownSleepPageUrl(tab.url, settings, runtimeBaseUrl)) {
     return { eligible: false, reason: 'already-sleeping' };
   }
 
@@ -609,6 +766,52 @@ export function isUrlSleepable(url) {
 
 export function isAllowlisted(url, allowlist = []) {
   return isDomainMatched(url, allowlist);
+}
+
+export function toggleAllowlistForHost(allowlist = [], host = '') {
+  const normalizedHost = String(host || '').trim().toLowerCase();
+  const normalizedAllowlist = normalizeAllowlist(allowlist);
+  if (!normalizedHost) {
+    return { enabled: false, allowlist: normalizedAllowlist };
+  }
+
+  const targetUrl = `https://${normalizedHost}/`;
+  const isEnabled = isAllowlisted(targetUrl, normalizedAllowlist);
+  return setAllowlistForHost(normalizedAllowlist, normalizedHost, !isEnabled);
+}
+
+export function setAllowlistForHost(allowlist = [], host = '', enabled = true) {
+  const normalizedHost = String(host || '').trim().toLowerCase();
+  const normalizedAllowlist = normalizeAllowlist(allowlist);
+  if (!normalizedHost) {
+    return { enabled: false, allowlist: normalizedAllowlist };
+  }
+
+  const targetUrl = `https://${normalizedHost}/`;
+  const isEnabled = isAllowlisted(targetUrl, normalizedAllowlist);
+  if (Boolean(enabled) === isEnabled) {
+    return { enabled: isEnabled, allowlist: normalizedAllowlist };
+  }
+
+  if (!enabled) {
+    const exactEntries = normalizedAllowlist.filter((entry) => (
+      entry === normalizedHost
+      || (isYouTubeFamilyDomain(entry) && isYouTubeFamilyDomain(normalizedHost) && !entry.startsWith('*.'))
+    ));
+    if (exactEntries.length === 0 && isEnabled) {
+      return { enabled: true, allowlist: normalizedAllowlist, blockedByPattern: true };
+    }
+    const exactSet = new Set(exactEntries);
+    const remaining = normalizedAllowlist.filter((entry) => !exactSet.has(entry));
+    if (isAllowlisted(targetUrl, remaining)) {
+      return { enabled: true, allowlist: normalizedAllowlist, blockedByPattern: true };
+    }
+    return { enabled: false, allowlist: remaining };
+  }
+
+  const nextAllowlist = Array.from(new Set([...normalizedAllowlist, normalizedHost])).sort();
+
+  return { enabled: Boolean(enabled), allowlist: nextAllowlist };
 }
 
 function isDomainMatched(url, patterns = []) {

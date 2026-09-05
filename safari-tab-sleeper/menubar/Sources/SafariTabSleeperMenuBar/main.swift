@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let resumeMenuItem = NSMenuItem(title: "Возобновить монитор", action: #selector(resumeMonitor), keyEquivalent: "")
     private let runtimeDirectory: URL
     private let pauseFile: URL
+    private let sleepServerURL = "http://127.0.0.1:17654/sleep"
 
     override init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -70,9 +71,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func sleepActiveSafariTab() {
         runInBackground({ [self] in
-            run("/usr/bin/osascript", [scriptPath("sleep-current-tab.applescript"), scriptPath("local-sleeper.html")])
+            run("/usr/bin/osascript", [
+                scriptPath("sleep-current-tab.applescript"),
+                sleepServerURL,
+                scriptPath("allowlist.txt")
+            ])
         }, completion: { [self] output in
-            notify("Активная вкладка усыплена", output.isEmpty ? "Активная вкладка Safari отправлена спать." : output)
+            if output.contains("reason=allowlisted") {
+                notify("Вкладка защищена", "Этот сайт отмечен как «Не усыплять».")
+            } else {
+                notify("Активная вкладка усыплена", output.isEmpty ? "Активная вкладка Safari отправлена спать." : output)
+            }
         })
     }
 
@@ -104,7 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func runScriptAction(title: String, scriptName: String, messagePrefix: String) {
         runInBackground({ [self] in
-            run("/usr/bin/osascript", [scriptPath(scriptName), scriptPath("local-sleeper.html"), scriptPath("allowlist.txt")])
+            run("/usr/bin/osascript", [scriptPath(scriptName), sleepServerURL, scriptPath("allowlist.txt")])
         }, completion: { [self] output in
             let sleptCount = numericField("slept_count", in: output) ?? 0
             notify(title, "\(messagePrefix): усыплено вкладок: \(sleptCount).")

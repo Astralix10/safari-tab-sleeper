@@ -1,5 +1,9 @@
 # Safari Tab Sleeper Release Notes
 
+## 0.3.11
+
+Fixes tabs sleeping after protection was enabled, stale media protection, premature timer deadlines, incorrect restore targets, and recovery records disappearing for duplicate tabs. The updated archive retains records for every open sleeping tab and compacts only unused records. See `AUDIT-2026-09-05.md` for validation and limitations.
+
 ## 0.1.2
 
 - Treat `www.youtube.com` in `Не усыплять сайт` as protection for the YouTube family: `youtube.com`, `*.youtube.com`, `youtu.be`, and YouTube embed/nocookie hosts.

@@ -6,6 +6,7 @@ import {
   applyProfile,
   applyPowerMode,
   buildLocalSleepPageUrl,
+  buildManualSleepDecision,
   buildSleepDecision,
   buildSleepPageUrl,
   chooseUnloadStrategy,
@@ -17,15 +18,19 @@ import {
   getSleepPageAutoRestoreDelay,
   isAggressiveDomain,
   isAllowlisted,
+  isKnownSleepPageUrl,
   isPressureDomain,
   isSleepPageUrl,
   makeRuntimeMessageListener,
+  mergeYouTubePageState,
   normalizeAllowlist,
   normalizeRestorableUrl,
   reconcileSleepingTabsWithOpenTabs,
+  setAllowlistForHost,
   shouldHealStuckSleepTab,
   shouldAutoRestoreSleepPage,
   shouldTreatYouTubeAsHighRisk,
+  toggleAllowlistForHost,
   mergeSettings,
 } from '../extension/background/core.js';
 
@@ -40,6 +45,26 @@ test('normalizeAllowlist trims comments, schemes, paths, and empty lines', () =>
     `),
     ['app.example.com', '*.internal.test', 'youtube.com'],
   );
+});
+
+test('mergeSettings clamps malformed values and keeps the sleep server on localhost', () => {
+  const settings = mergeSettings({
+    profile: 'unknown',
+    inactivityMinutes: 0,
+    youtubeVideoThreshold: 9999,
+    youtubeHighRiskInactiveSeconds: 'not-a-number',
+    aggressiveInactiveSeconds: -10,
+    sleepServerUrl: 'https://evil.example/collect',
+    skipPinned: 'false',
+  });
+
+  assert.equal(settings.profile, 'balanced');
+  assert.equal(settings.inactivityMinutes, 1);
+  assert.equal(settings.youtubeVideoThreshold, 500);
+  assert.equal(settings.youtubeHighRiskInactiveSeconds, 60);
+  assert.equal(settings.aggressiveInactiveSeconds, 10);
+  assert.equal(settings.sleepServerUrl, DEFAULT_SETTINGS.sleepServerUrl);
+  assert.equal(settings.skipPinned, true);
 });
 
 test('buildSleepDecision sleeps an inactive normal tab after the configured timeout', () => {
@@ -106,6 +131,65 @@ test('allowlisting YouTube protects the whole YouTube site family', () => {
   assert.equal(isAllowlisted('https://example.com/youtube.com', allowlist), false);
 });
 
+test('allowlist toggle removes the matching YouTube family without touching other sites', () => {
+  assert.deepEqual(
+    toggleAllowlistForHost(['www.youtube.com', '*.example.com'], 'music.youtube.com'),
+    { enabled: false, allowlist: ['*.example.com'] },
+  );
+  assert.deepEqual(
+    toggleAllowlistForHost(['*.example.com'], 'www.youtube.com'),
+    { enabled: true, allowlist: ['*.example.com', 'www.youtube.com'] },
+  );
+});
+
+test('explicit allowlist state is idempotent for repeated switch events', () => {
+  assert.deepEqual(
+    setAllowlistForHost([], 'www.youtube.com', true),
+    { enabled: true, allowlist: ['www.youtube.com'] },
+  );
+  assert.deepEqual(
+    setAllowlistForHost(['www.youtube.com'], 'www.youtube.com', true),
+    { enabled: true, allowlist: ['www.youtube.com'] },
+  );
+  assert.deepEqual(
+    setAllowlistForHost(['www.youtube.com', '*.example.com'], 'music.youtube.com', false),
+    { enabled: false, allowlist: ['*.example.com'] },
+  );
+});
+
+test('manual sleep cannot bypass a protected site', () => {
+  const decision = buildManualSleepDecision({
+    tab: {
+      id: 17,
+      active: true,
+      audible: false,
+      pinned: false,
+      url: 'https://www.youtube.com/watch?v=protected',
+    },
+    state: { dirty: false },
+    settings: { ...DEFAULT_SETTINGS, allowlist: ['youtube.com'] },
+  });
+
+  assert.deepEqual(decision, { eligible: false, reason: 'allowlisted' });
+});
+
+test('an exact rule covered by a wildcard cannot falsely report protection disabled', () => {
+  assert.deepEqual(setAllowlistForHost(['app.example.com', '*.example.com'], 'app.example.com', false), {
+    enabled: true, allowlist: ['app.example.com', '*.example.com'], blockedByPattern: true,
+  });
+});
+
+test('balanced mode protects muted video and skips loading or already discarded pages', () => {
+  for (const extra of [{ status: 'loading' }, { discarded: true }]) {
+    assert.equal(buildSleepDecision({ tab: { id: 1, url: 'https://example.com', ...extra }, state: { lastActiveAt: 0 }, now: 500_000 }).sleep, false);
+  }
+  assert.equal(buildSleepDecision({ tab: { id: 1, url: 'https://example.com' }, state: { lastActiveAt: 0, mediaPlaying: true }, now: 500_000, sameDomainTabCount: 2 }).sleep, false);
+});
+
+test('the restore watchdog respects restoreOnFocus being disabled', () => {
+  assert.equal(shouldHealStuckSleepTab({ tab: { active: true, url: buildLocalSleepPageUrl(DEFAULT_SETTINGS.sleepServerUrl, 'token') }, settings: { ...DEFAULT_SETTINGS, restoreOnFocus: false } }), false);
+});
+
 test('profiles tune sleep timing and media behavior', () => {
   assert.deepEqual(applyProfile('safe'), {
     profile: 'safe',
@@ -121,38 +205,93 @@ test('profiles tune sleep timing and media behavior', () => {
   });
   assert.deepEqual(applyProfile('aggressive'), {
     profile: 'aggressive',
-    inactivityMinutes: 1,
+    inactivityMinutes: 5,
     youtubeHighRiskInactiveSeconds: 20,
     skipAudible: false,
   });
 });
 
-test('power-aware mode sleeps faster on battery and softer on power', () => {
+test('power-aware mode never changes the configured inactivity timer', () => {
   const balanced = mergeSettings({ profile: 'balanced' });
   const battery = applyPowerMode(balanced, { source: 'battery', ok: true });
   const power = applyPowerMode(balanced, { source: 'power', ok: true });
   const disabled = applyPowerMode({ ...balanced, powerAware: false }, { source: 'battery', ok: true });
 
   assert.equal(battery.powerMode, 'battery');
-  assert.equal(battery.inactivityMinutes, 3);
+  assert.equal(battery.inactivityMinutes, 5);
   assert.equal(battery.youtubeHighRiskInactiveSeconds, 45);
   assert.equal(power.powerMode, 'power');
-  assert.equal(power.inactivityMinutes, 10);
+  assert.equal(power.inactivityMinutes, 5);
   assert.equal(power.youtubeHighRiskInactiveSeconds, 120);
   assert.equal(disabled.inactivityMinutes, balanced.inactivityMinutes);
   assert.equal(disabled.powerMode, 'default');
 });
 
+test('aggressive profile sleeps normal tabs at five minutes, including on power', () => {
+  const now = 1_000_000;
+  const settings = applyPowerMode(mergeSettings({
+    profile: 'aggressive',
+    inactivityMinutes: 1,
+  }), { source: 'power', ok: true });
+  const tab = {
+    id: 19,
+    active: false,
+    audible: false,
+    pinned: false,
+    url: 'https://example.com/report',
+  };
+
+  assert.equal(settings.inactivityMinutes, 5);
+  assert.deepEqual(buildSleepDecision({
+    tab,
+    state: { lastActiveAt: now - 299_999, dirty: false },
+    settings,
+    now,
+  }), { sleep: false, reason: 'not-idle-long-enough' });
+  assert.deepEqual(buildSleepDecision({
+    tab,
+    state: { lastActiveAt: now - 300_000, dirty: false },
+    settings,
+    now,
+  }), { sleep: true, reason: 'inactive-timeout' });
+});
+
+test('aggressive profile protects the only playing media tab for a domain', () => {
+  const now = 1_000_000;
+  const settings = mergeSettings({ profile: 'aggressive' });
+  const tab = {
+    id: 20,
+    active: false,
+    audible: false,
+    pinned: false,
+    url: 'https://video.example/watch/1',
+  };
+  const state = {
+    lastActiveAt: now - 300_000,
+    dirty: false,
+    mediaPlaying: true,
+  };
+
+  assert.deepEqual(buildSleepDecision({ tab, state, settings, now, sameDomainTabCount: 1 }), {
+    sleep: false,
+    reason: 'single-media-tab',
+  });
+  assert.deepEqual(buildSleepDecision({ tab, state, settings, now, sameDomainTabCount: 2 }), {
+    sleep: true,
+    reason: 'inactive-timeout',
+  });
+  assert.deepEqual(buildSleepDecision({
+    tab: { ...tab, audible: true },
+    state: { ...state, mediaPlaying: false },
+    settings,
+    now,
+    sameDomainTabCount: 1,
+  }), { sleep: false, reason: 'single-media-tab' });
+});
+
 test('stuck active sleep tabs are eligible for a retry healer', () => {
   const settings = mergeSettings({});
-  const sleepUrl = buildLocalSleepPageUrl(settings.sleepServerUrl, {
-    token: 'heal-token',
-    url: 'https://example.com/report',
-    title: 'Report',
-    sleptAt: 1_000,
-    reason: 'inactive-timeout',
-    autoRestore: true,
-  });
+  const sleepUrl = buildLocalSleepPageUrl(settings.sleepServerUrl, 'heal-token');
 
   assert.equal(
     shouldHealStuckSleepTab({
@@ -229,6 +368,37 @@ test('YouTube high-risk tabs can sleep earlier after many same-tab video navigat
   });
 });
 
+test('YouTube navigation count survives page reloads and reset state', () => {
+  assert.deepEqual(
+    mergeYouTubePageState(
+      { youtubeVideoCount: 25, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=a' },
+      { youtubeVideoCount: 1, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=a' },
+    ),
+    { youtubeVideoCount: 25, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=a' },
+  );
+  assert.deepEqual(
+    mergeYouTubePageState(
+      { youtubeVideoCount: 25, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=a' },
+      { youtubeVideoCount: 1, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=b' },
+    ),
+    { youtubeVideoCount: 26, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=b' },
+  );
+  assert.deepEqual(
+    mergeYouTubePageState(
+      { youtubeVideoCount: 0, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=b' },
+      { youtubeVideoCount: 40, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=b' },
+    ),
+    { youtubeVideoCount: 0, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=b' },
+  );
+  assert.deepEqual(
+    mergeYouTubePageState(
+      { youtubeVideoCount: 3, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=b' },
+      { youtubeVideoCount: 12, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=c' },
+    ),
+    { youtubeVideoCount: 12, youtubeLastVideoUrl: 'https://www.youtube.com/watch?v=c' },
+  );
+});
+
 test('sleep page URLs use opaque tokens instead of leaking original URLs', () => {
   const runtimeUrl = 'safari-web-extension://example-id/';
   const token = 'abc123';
@@ -237,6 +407,8 @@ test('sleep page URLs use opaque tokens instead of leaking original URLs', () =>
   assert.equal(url, 'safari-web-extension://example-id/sleep/sleep.html?token=abc123');
   assert.equal(isSleepPageUrl(url, runtimeUrl), true);
   assert.equal(url.includes('youtube.com'), false);
+  assert.equal(isSleepPageUrl('safari-web-extension://foreign-id/sleep/sleep.html?token=abc123', runtimeUrl), false);
+  assert.equal(isKnownSleepPageUrl(url, DEFAULT_SETTINGS, runtimeUrl), true);
 });
 
 test('local sleep server URLs survive Safari session restore without leaking the original URL plainly', () => {
@@ -248,11 +420,55 @@ test('local sleep server URLs survive Safari session restore without leaking the
     reason: 'inactive-timeout',
     autoRestore: true,
   };
-  const url = buildLocalSleepPageUrl('http://127.0.0.1:17654/sleep', entry);
+  const url = buildLocalSleepPageUrl('http://127.0.0.1:17654/sleep', entry.token);
 
-  assert.equal(url.startsWith('http://127.0.0.1:17654/sleep#fallback='), true);
+  assert.equal(url, 'http://127.0.0.1:17654/sleep#token=abc123');
   assert.equal(url.includes('mail.google.com'), false);
-  assert.deepEqual(decodeSleepFallback(new URL(url).hash), entry);
+  assert.equal(isKnownSleepPageUrl(url, DEFAULT_SETTINGS), true);
+  assert.deepEqual(
+    buildManualSleepDecision({
+      tab: { id: 1, active: true, pinned: false, audible: false, url },
+      state: {},
+      settings: DEFAULT_SETTINGS,
+    }),
+    { eligible: false, reason: 'already-sleeping' },
+  );
+});
+
+test('legacy nested sleep URLs still unwrap to the original page', () => {
+  const originalUrl = 'https://www.youtube.com/watch?v=original';
+  const firstSleepUrl = `http://127.0.0.1:17654/sleep${encodeSleepFallback({
+    token: 'first',
+    url: originalUrl,
+    title: 'Original video',
+    sleptAt: 1,
+    reason: 'memory-pressure',
+  })}`;
+  const nestedSleepUrl = `http://127.0.0.1:17654/sleep${encodeSleepFallback({
+    token: 'second',
+    url: firstSleepUrl,
+    title: '[sleep] Original video',
+    sleptAt: 2,
+    reason: 'memory-pressure',
+  })}`;
+
+  assert.equal(normalizeRestorableUrl(nestedSleepUrl), originalUrl);
+
+  assert.equal(
+    reconcileSleepingTabsWithOpenTabs(
+      {
+        second: {
+          token: 'second',
+          tabId: 42,
+          url: nestedSleepUrl,
+          title: '[sleep] Original video',
+        },
+      },
+      [{ id: 42, url: nestedSleepUrl }],
+      DEFAULT_SETTINGS,
+    ).second.url,
+    originalUrl,
+  );
 });
 
 test('sleep fallback restores Safari Reader URLs as normal web URLs', () => {
@@ -274,6 +490,11 @@ test('sleep fallback restores Safari Reader URLs as normal web URLs', () => {
   assert.equal(decoded.url, 'https://example.com/story?id=42');
 });
 
+test('restorable URL normalization never extracts a web URL from script text', () => {
+  assert.equal(normalizeRestorableUrl("javascript:location='https://evil.example/'"), '');
+  assert.equal(normalizeRestorableUrl('not a URL https://evil.example/'), '');
+});
+
 
 test('runtime message listener replies through sendResponse for callback-based Safari APIs', async () => {
   const listener = makeRuntimeMessageListener(async (message) => {
@@ -290,7 +511,7 @@ test('runtime message listener replies through sendResponse for callback-based S
   assert.deepEqual(responses, [{ ok: true, echo: 42 }]);
 });
 
-test('sleep fallback survives without storage and keeps the original URL out of the query string', () => {
+test('modern sleep links contain only an opaque token', () => {
   const entry = {
     token: 'abc123',
     url: 'https://www.youtube.com/watch?v=abc',
@@ -300,12 +521,12 @@ test('sleep fallback survives without storage and keeps the original URL out of 
     autoRestore: true,
   };
   const encoded = encodeSleepFallback(entry);
-  const pageUrl = buildSleepPageUrl('safari-web-extension://example-id/', entry.token, entry);
+  const pageUrl = buildSleepPageUrl('safari-web-extension://example-id/', entry.token);
 
   assert.equal(pageUrl.includes('token=abc123'), true);
   assert.equal(pageUrl.includes('youtube.com'), false);
   assert.deepEqual(decodeSleepFallback(encoded), entry);
-  assert.deepEqual(decodeSleepFallback(new URL(pageUrl).hash), entry);
+  assert.equal(new URL(pageUrl).hash, '');
 });
 
 test('sleeping tab storage is pruned to currently open sleeping tabs', () => {
@@ -346,11 +567,11 @@ test('sleeping tab storage is pruned to currently open sleeping tabs', () => {
     [
       {
         id: 12,
-        url: buildSleepPageUrl('safari-web-extension://example-id/', 'live-token', liveEntry),
+        url: buildSleepPageUrl('safari-web-extension://example-id/', 'live-token'),
       },
       {
         id: 34,
-        url: buildLocalSleepPageUrl(DEFAULT_SETTINGS.sleepServerUrl, localEntry),
+        url: buildLocalSleepPageUrl(DEFAULT_SETTINGS.sleepServerUrl, localEntry.token),
       },
       {
         id: 56,
@@ -427,21 +648,23 @@ test('sleep reason tags are compact and stable', () => {
   assert.equal(getSleepReasonTag('manual-all-except-current'), 'manual');
 });
 
-test('sleeping tab icon prefers original favicon and falls back to site favicon', () => {
+test('sleeping tab icon never contacts the original site', () => {
   assert.equal(
     getSleepingTabIconUrl({
       pageUrl: 'https://www.youtube.com/watch?v=abc',
       favIconUrl: 'https://www.youtube.com/s/desktop/favicon.ico',
     }),
-    'https://www.youtube.com/s/desktop/favicon.ico',
+    '',
   );
   assert.equal(
     getSleepingTabIconUrl({
       pageUrl: 'https://www.youtube.com/watch?v=abc',
       favIconUrl: '',
     }),
-    'https://www.youtube.com/favicon.ico',
+    '',
   );
+  const embedded = 'data:image/png;base64,AA==';
+  assert.equal(getSleepingTabIconUrl({ pageUrl: 'https://example.com', favIconUrl: embedded }), embedded);
   assert.equal(
     getSleepingTabIconUrl({
       pageUrl: 'file:///tmp/local.html',
@@ -486,5 +709,12 @@ test('pressure domains include common heavy web apps and support custom addition
   assert.equal(isPressureDomain('https://meet.google.com/abc-defg-hij', DEFAULT_SETTINGS), true);
   assert.equal(isPressureDomain('https://www.figma.com/file/abc', DEFAULT_SETTINGS), true);
   assert.equal(isPressureDomain('https://example.com/', DEFAULT_SETTINGS), false);
+  assert.equal(isPressureDomain('https://youtube.com.evil.example/', DEFAULT_SETTINGS), false);
+  assert.equal(isPressureDomain('https://evil.example/?next=youtube.com', DEFAULT_SETTINGS), false);
+  assert.equal(isPressureDomain(buildLocalSleepPageUrl(DEFAULT_SETTINGS.sleepServerUrl, {
+    token: 'sleep-token',
+    url: 'https://www.youtube.com/watch?v=abc',
+    title: 'Video',
+  }), DEFAULT_SETTINGS), false);
   assert.equal(isPressureDomain('https://video.internal.test/', { ...DEFAULT_SETTINGS, pressureDomains: ['video.internal.test'] }), true);
 });

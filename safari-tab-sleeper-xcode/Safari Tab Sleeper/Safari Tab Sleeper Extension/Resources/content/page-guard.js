@@ -4,6 +4,9 @@
   let youtubeVideoCount = 0;
   let youtubeLastVideoUrl = '';
   let lastHref = location.href;
+  let lastSentState = '';
+  const fieldSnapshots = new WeakMap();
+  const editableSelector = 'input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]), textarea, select, [contenteditable="true"]';
 
   function isEditableElement(target) {
     if (!target) {
@@ -11,31 +14,99 @@
     }
 
     const tagName = target.tagName?.toLowerCase();
-    return target.isContentEditable || tagName === 'textarea' || tagName === 'select' || tagName === 'input';
+    return target.isContentEditable || tagName === 'textarea' || tagName === 'select'
+      || (tagName === 'input' && !['hidden', 'button', 'submit', 'reset'].includes(target.type));
   }
 
-  function isYouTubeWatchUrl(url) {
+  function youtubeVideoIdentity(url) {
     try {
       const parsed = new URL(url);
       const host = parsed.hostname.toLowerCase();
-      return (host === 'youtube.com' || host.endsWith('.youtube.com')) && parsed.pathname === '/watch' && parsed.searchParams.has('v');
+      if (host === 'youtu.be') {
+        return parsed.pathname.split('/').filter(Boolean)[0] || '';
+      }
+      if (host !== 'youtube.com' && !host.endsWith('.youtube.com')) {
+        return '';
+      }
+      if (parsed.pathname === '/watch') {
+        return parsed.searchParams.get('v') || '';
+      }
+      const shortMatch = parsed.pathname.match(/^\/(?:shorts|live)\/([^/]+)/);
+      return shortMatch?.[1] || '';
     } catch {
-      return false;
+      return '';
     }
+  }
+
+  function fieldValue(field) {
+    if (field instanceof HTMLInputElement && (field.type === 'checkbox' || field.type === 'radio')) {
+      return `${field.checked}`;
+    }
+    if (field instanceof HTMLSelectElement) {
+      return Array.from(field.selectedOptions, (option) => option.value).join('\u0000');
+    }
+    return String(field.value ?? field.textContent ?? '');
+  }
+
+  function rememberFields(root = document) {
+    for (const field of root.querySelectorAll?.(editableSelector) ?? []) {
+      if (!fieldSnapshots.has(field)) {
+        fieldSnapshots.set(field, fieldValue(field));
+      }
+    }
+  }
+
+  function hasProgrammaticFieldChanges() {
+    rememberFields();
+    for (const field of document.querySelectorAll(editableSelector)) {
+      if (fieldSnapshots.get(field) !== fieldValue(field)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function mediaIsPlaying() {
+    return Array.from(document.querySelectorAll('audio, video'))
+      .some((media) => !media.paused && !media.ended && media.readyState > 0);
   }
 
   function sendState() {
     try {
-      api.runtime.sendMessage({
+      const state = {
         type: 'tab-sleeper:page-state',
+        pageUrl: location.href,
+        pageTitle: document.title,
         dirty,
+        mediaPlaying: mediaIsPlaying(),
         youtubeVideoCount,
         youtubeLastVideoUrl,
-      });
+      };
+      const signature = JSON.stringify(state);
+      if (signature === lastSentState) return;
+      lastSentState = signature;
+      Promise.resolve(api.runtime.sendMessage(state)).catch(() => { lastSentState = ''; });
     } catch {
+      lastSentState = '';
       // The background worker may be asleep or unavailable.
     }
   }
+
+  function readPageState() {
+    dirty ||= hasProgrammaticFieldChanges();
+    return {
+      canSleep: !dirty,
+      dirty,
+      mediaPlaying: mediaIsPlaying(),
+      pageUrl: location.href,
+      pageTitle: document.title,
+      youtubeVideoCount,
+      youtubeLastVideoUrl,
+    };
+  }
+
+  // Available only in the extension's isolated world, including subframes.
+  globalThis.__tabSleeperReadState = readPageState;
 
   function handleNavigationChange() {
     const href = location.href;
@@ -44,11 +115,12 @@
     }
 
     lastHref = href;
-    if (isYouTubeWatchUrl(href) && href !== youtubeLastVideoUrl) {
+    const videoIdentity = youtubeVideoIdentity(href);
+    if (videoIdentity && videoIdentity !== youtubeLastVideoUrl) {
       youtubeVideoCount += 1;
-      youtubeLastVideoUrl = href;
-      sendState();
+      youtubeLastVideoUrl = videoIdentity;
     }
+    sendState();
   }
 
   document.addEventListener('input', (event) => {
@@ -66,13 +138,22 @@
   }, true);
 
   document.addEventListener('submit', () => {
-    dirty = false;
+    dirty = true;
     sendState();
   }, true);
 
-  window.addEventListener('pageshow', sendState);
+  for (const eventName of ['play', 'playing', 'pause', 'ended', 'emptied']) {
+    document.addEventListener(eventName, sendState, true);
+  }
+  document.addEventListener('visibilitychange', sendState, true);
+
+  window.addEventListener('pageshow', () => {
+    rememberFields();
+    sendState();
+  });
   window.addEventListener('popstate', () => setTimeout(handleNavigationChange, 0));
-  window.setInterval(handleNavigationChange, 1000);
+  window.addEventListener('hashchange', handleNavigationChange);
+  document.addEventListener('yt-navigate-finish', handleNavigationChange);
 
   for (const method of ['pushState', 'replaceState']) {
     const original = history[method];
@@ -83,22 +164,35 @@
     };
   }
 
-  api.runtime.onMessage.addListener((message) => {
-    if (message?.type === 'tab-sleeper:can-sleep') {
-      return Promise.resolve({
-        canSleep: !dirty,
-        dirty,
-        youtubeVideoCount,
-        youtubeLastVideoUrl,
+  api.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === 'tab-sleeper:get-page-info') {
+      sendResponse({
+        pageUrl: location.href,
+        pageTitle: document.title,
       });
+      return false;
+    }
+
+    if (message?.type === 'tab-sleeper:can-sleep') {
+      sendResponse(readPageState());
+      return false;
+    }
+
+    if (message?.type === 'tab-sleeper:reset-youtube-counter') {
+      youtubeVideoCount = 0;
+      youtubeLastVideoUrl = youtubeVideoIdentity(location.href);
+      sendState();
+      sendResponse({ ok: true });
+      return false;
     }
 
     return false;
   });
 
-  if (isYouTubeWatchUrl(location.href)) {
+  rememberFields();
+  if (youtubeVideoIdentity(location.href)) {
     youtubeVideoCount = 1;
-    youtubeLastVideoUrl = location.href;
+    youtubeLastVideoUrl = youtubeVideoIdentity(location.href);
   }
   sendState();
 })();

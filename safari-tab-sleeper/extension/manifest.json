@@ -1,10 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Safari Tab Sleeper",
-  "version": "0.1.2",
+  "version": "0.3.11",
   "description": "Усыпляет неактивные вкладки Safari, восстанавливает их при выборе и чистит тяжёлые вкладки при давлении на память.",
   "permissions": [
+    "activeTab",
     "alarms",
+    "notifications",
+    "scripting",
     "storage",
     "tabs"
   ],
@@ -13,7 +16,7 @@
     "https://*/*"
   ],
   "background": {
-    "service_worker": "background/background.js",
+    "service_worker": "background/service-worker-0.2.9.js",
     "type": "module"
   },
   "action": {
@@ -30,7 +33,9 @@
       "js": [
         "content/page-guard.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
     }
   ],
   "icons": {
