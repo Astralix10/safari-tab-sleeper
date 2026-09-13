@@ -54,7 +54,7 @@ test('worker resolves explicit tab IDs first', async () => {
   assert.equal(queryBody.includes("debugActiveTab('synthetic-hint'"), false);
   assert.equal(queryBody.indexOf('api.tabs.get(hintedTabId)') < queryBody.indexOf('api.tabs.query({})'), true);
 
-  assert.equal(worker.includes("reason: 'dirty-state-unavailable'"), true);
+  assert.equal(worker.includes("reason: 'dirty-state-unavailable'"), false);
   assert.equal(worker.includes('delete states[tabId]'), true);
   assert.equal(worker.includes('countTabsByDomain(tabs)'), true);
   assert.equal(worker.includes('sameDomainTabCount'), true);

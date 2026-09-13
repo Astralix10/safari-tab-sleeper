@@ -10,7 +10,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   powerAware: true,
   skipPinned: true,
   skipAudible: true,
-  protectDirtyForms: true,
+  protectDirtyForms: false,
   allowlist: [],
   aggressiveList: [],
   pressureDomains: [

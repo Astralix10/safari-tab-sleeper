@@ -323,7 +323,6 @@ function formatActionReason(reason) {
     allowlisted: 'для этого сайта включена защита от усыпления',
     'already-sleeping': 'вкладка уже спит',
     'dirty-form': 'на странице есть несохранённые данные',
-    'dirty-state-unavailable': 'не удалось безопасно проверить несохранённые данные',
     'tab-changed': 'вкладка успела перейти на другую страницу',
     'covered-by-allowlist-pattern': 'сайт защищён общим шаблоном в настройках',
     'missing-active-tab': 'Safari не передал активную вкладку',

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.12
+
+- Continue sleeping when Safari cannot inspect page state, including failures at the final pre-navigation check. Missing access is no longer treated as unsaved input.
+- Disable form protection by default and migrate existing installations so unsaved input no longer blocks manual or automatic sleep. It can be re-enabled explicitly in settings; unsaved edits may be lost while disabled.
+- Keep site protection and known media safeguards.
+- Add regression coverage for manual/automatic sleep, late inspection failures and preserved protection rules.
+
 ## 0.3.11
 
 - Revalidate tab identity, active/pinned state, forms, media and current site protection immediately before sleep or restore.

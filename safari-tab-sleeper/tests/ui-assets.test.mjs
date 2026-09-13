@@ -80,7 +80,7 @@ test('popup uses one centered allowlist switch instead of fast-sleep shortcut', 
   assert.equal(background.includes('initializeSettingsFromCompanion'), true);
   assert.equal(background.includes('...companion.allowlist'), true);
   assert.equal(background.includes('restoredAllowlist'), true);
-  assert.equal(background.includes('SETTINGS_SCHEMA_VERSION = 2'), true);
+  assert.equal(background.includes('SETTINGS_SCHEMA_VERSION = 3'), true);
   assert.equal(background.includes('settingsSchemaVersion'), true);
   assert.equal(background.includes('reconcileCompanionSettings'), false);
   assert.equal(background.includes('void syncCompanionSettings(baseSettings)'), false);

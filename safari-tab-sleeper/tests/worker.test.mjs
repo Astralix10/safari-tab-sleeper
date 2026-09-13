@@ -13,10 +13,10 @@ const flush = async () => { for (let i = 0; i < 30; i++) await new Promise(setIm
 const event = () => ({ listeners: [], addListener(fn) { this.listeners.push(fn); }, async emit(...args) { for (const fn of this.listeners) await fn(...args); await flush(); } });
 const ordinary = (id, extra = {}) => ({ id, windowId: 1, active: false, pinned: false, audible: false, status: 'complete', url: `https://example${id}.com/`, title: `Tab ${id}`, ...extra });
 
-async function worker(t, initialTabs, customSettings = {}) {
+async function worker(t, initialTabs, customSettings = {}, settingsSchemaVersion = 3) {
   const tabs = new Map(initialTabs.map((tab) => [tab.id, clone(tab)]));
   let now = 1_000_000;
-  const store = { settings: mergeSettings(customSettings), settingsSchemaVersion: 2, sleepingTabs: {}, tabStates: {} };
+  const store = { settings: mergeSettings(customSettings), settingsSchemaVersion, sleepingTabs: {}, tabStates: {} };
   const updates = [];
   const archive = new Map();
   const timers = new Map();
@@ -97,6 +97,79 @@ test('cached playing media does not prevent sleeping after playback stops', asyn
   assert.equal(w.updates.length, 1);
 });
 
+test('manual sleep completes when Safari cannot inspect the page', async (t) => {
+  const w = await worker(t, [ordinary(1, { active: true })]);
+  w.hooks.guard = () => { throw new Error('page-access-denied'); };
+  const result = await w.send('sleep-current', { currentTabId: 1 });
+  assert.equal(result.ok, true);
+  assert.deepEqual(w.updates.map((update) => update.id), [1]);
+  assert.equal(w.archive.size, 1);
+});
+
+test('five-minute automatic sleep continues without a content-script response', async (t) => {
+  const w = await worker(t, [ordinary(2)], { profile: 'aggressive' });
+  w.hooks.guard = () => { throw new Error('page-access-denied'); };
+  w.age(2);
+  await w.scan();
+  assert.deepEqual(w.updates.map((update) => update.id), [2]);
+});
+
+test('sleep still completes if page inspection fails only at the final check', async (t) => {
+  const w = await worker(t, [ordinary(1, { active: true })]);
+  w.hooks.fetch = (path, body) => {
+    if (path === '/archive-entry' && body.entry) {
+      w.hooks.guard = () => { throw new Error('page-access-denied'); };
+    }
+  };
+  assert.equal((await w.send('sleep-current', { currentTabId: 1 })).ok, true);
+  assert.equal(w.updates.length, 1);
+});
+
+test('unavailable inspection does not bypass site protection', async (t) => {
+  const w = await worker(t, [ordinary(1, { active: true })], { allowlist: ['example1.com'] });
+  w.hooks.guard = () => { throw new Error('page-access-denied'); };
+  assert.equal((await w.send('sleep-current', { currentTabId: 1 })).reason, 'allowlisted');
+  assert.equal(w.updates.length, 0);
+});
+
+test('explicitly re-enabled form protection still works when frame inspection fails', async (t) => {
+  const w = await worker(t, [ordinary(1, { active: true })], { protectDirtyForms: true });
+  w.guards.set(1, [{ frameId: 0, result: { dirty: true, mediaPlaying: false } }]);
+  w.hooks.guard = () => { throw new Error('frame-access-denied'); };
+  assert.equal((await w.send('sleep-current', { currentTabId: 1 })).reason, 'dirty-form');
+  assert.equal(w.updates.length, 0);
+});
+
+test('existing installations stop blocking on unsaved input without changing site protection', async (t) => {
+  const w = await worker(t, [ordinary(1, { active: true })], {
+    protectDirtyForms: true, allowlist: ['protected.example'], inactivityMinutes: 9,
+  }, 2);
+  assert.equal(w.store.settingsSchemaVersion, 3);
+  assert.equal(w.store.settings.protectDirtyForms, false);
+  assert.deepEqual(w.store.settings.allowlist, ['protected.example']);
+  assert.equal(w.store.settings.inactivityMinutes, 9);
+  w.guards.set(1, [{ frameId: 0, result: { dirty: true, mediaPlaying: false } }]);
+  assert.equal((await w.send('sleep-current', { currentTabId: 1 })).ok, true);
+  assert.equal(w.updates.length, 1);
+});
+
+test('automatic sleep ignores unsaved input by default', async (t) => {
+  const w = await worker(t, [ordinary(2)], { profile: 'aggressive' });
+  w.guards.set(2, [{ frameId: 0, result: { dirty: true, mediaPlaying: false } }]);
+  w.age(2);
+  await w.scan();
+  assert.equal(w.updates.length, 1);
+});
+
+test('known unique media remains protected when inspection is unavailable', async (t) => {
+  const w = await worker(t, [ordinary(2)], { profile: 'aggressive' });
+  w.store.tabStates[2].mediaPlaying = true;
+  w.hooks.guard = () => { throw new Error('page-access-denied'); };
+  w.age(2);
+  await w.scan();
+  assert.equal(w.updates.length, 0);
+});
+
 test('five minutes start when leaving the tab, using persisted active state', async (t) => {
   const w = await worker(t, [ordinary(1, { active: true }), ordinary(2)], { profile: 'aggressive' });
   w.advance(59_000);
@@ -121,7 +194,7 @@ test('companion GET requests authenticate when Safari omits Origin', async (t) =
 
 for (const change of ['active', 'pinned', 'allowlist', 'url', 'dirty']) {
   test(`sleep is cancelled if ${change} changes during archive preparation`, async (t) => {
-    const w = await worker(t, [ordinary(2)], { profile: 'aggressive' });
+    const w = await worker(t, [ordinary(2)], { profile: 'aggressive', protectDirtyForms: true });
     w.age(2);
     w.hooks.fetch = async (path, body) => {
       if (path !== '/archive-entry' || !body.entry) return;

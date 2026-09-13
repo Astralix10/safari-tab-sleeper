@@ -32,7 +32,7 @@ import { companionMutationHeaders } from '../shared/companion-auth.js';
 const api = globalThis.browser ?? globalThis.chrome;
 const RUNTIME_BASE_URL = api.runtime.getURL('/');
 const SCAN_ALARM = 'tab-sleeper-scan';
-const SETTINGS_SCHEMA_VERSION = 2;
+const SETTINGS_SCHEMA_VERSION = 3;
 const STORAGE_KEYS = {
   settings: 'settings',
   settingsSchemaVersion: 'settingsSchemaVersion',
@@ -152,7 +152,8 @@ async function readSettings() {
 }
 
 async function initializeSettingsFromCompanion(storedSettings = null) {
-  const baseline = mergeSettings(storedSettings ?? DEFAULT_SETTINGS);
+  // Version 3 makes form protection opt-in for existing installations too.
+  const baseline = mergeSettings({ ...(storedSettings ?? DEFAULT_SETTINGS), protectDirtyForms: false });
   const companion = await readLocalJson(baseline, '/settings');
   const restoredAllowlist = companion?.ready && Array.isArray(companion.allowlist)
     ? normalizeAllowlist([...(baseline.allowlist ?? []), ...companion.allowlist])
@@ -264,11 +265,13 @@ async function ensureTabState(tab, knownState = null) {
 
 async function askPageCanSleep(tab, settings, state) {
   let response = null;
+  const observations = [state];
   try {
     response = await boundedPageRequest(api.tabs.sendMessage(tab.id, { type: 'tab-sleeper:can-sleep' }, { frameId: 0 }));
   } catch {
     // Older Safari tabs may have no content-script receiver yet.
   }
+  if (response) observations.push(response);
 
   if (api.scripting?.executeScript) {
     try {
@@ -304,6 +307,7 @@ async function askPageCanSleep(tab, settings, state) {
       }));
       const topFrame = results?.find((frame) => frame.frameId === 0)?.result;
       const frames = results?.map((frame) => frame.result).filter((frame) => typeof frame?.dirty === 'boolean') ?? [];
+      observations.push(...frames);
       if (typeof topFrame?.dirty === 'boolean' && frames.length === results.length) {
         response = {
           ...topFrame,
@@ -314,7 +318,7 @@ async function askPageCanSleep(tab, settings, state) {
         response = null;
       }
     } catch {
-      // A top-frame response cannot prove that embedded forms and media are safe.
+      // Keep any known state when Safari withholds access to an embedded frame.
       response = null;
     }
   }
@@ -330,7 +334,15 @@ async function askPageCanSleep(tab, settings, state) {
     return { ...response, canSleep: !settings.protectDirtyForms || !response.dirty };
   }
 
-  return { canSleep: false, reason: 'dirty-state-unavailable', mediaPlaying: Boolean(tab.audible), missingContentScript: true };
+  // Missing access is not a veto. Preserve reported form/media state without
+  // treating an unknown page as if it contained unsaved input.
+  const dirty = observations.some((observation) => observation?.dirty === true);
+  return {
+    canSleep: !settings.protectDirtyForms || !dirty,
+    dirty,
+    mediaPlaying: Boolean(tab.audible || observations.some((observation) => observation?.mediaPlaying === true)),
+    missingContentScript: true,
+  };
 }
 
 async function notifyOnce(id, title, message) {

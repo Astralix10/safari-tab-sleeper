@@ -107,7 +107,7 @@ test('buildSleepDecision skips active, pinned, audible, internal, dirty, and all
   assert.equal(buildSleepDecision({ tab: { ...baseTab, pinned: true }, state: oldState, settings: DEFAULT_SETTINGS, now }).sleep, false);
   assert.equal(buildSleepDecision({ tab: { ...baseTab, audible: true }, state: oldState, settings: DEFAULT_SETTINGS, now }).sleep, false);
   assert.equal(buildSleepDecision({ tab: { ...baseTab, url: 'about:blank' }, state: oldState, settings: DEFAULT_SETTINGS, now }).sleep, false);
-  assert.equal(buildSleepDecision({ tab: baseTab, state: { ...oldState, dirty: true }, settings: DEFAULT_SETTINGS, now }).sleep, false);
+  assert.equal(buildSleepDecision({ tab: baseTab, state: { ...oldState, dirty: true }, settings: { ...DEFAULT_SETTINGS, protectDirtyForms: true }, now }).sleep, false);
   assert.equal(
     buildSleepDecision({
       tab: { ...baseTab, url: 'https://app.example.com/dashboard' },
