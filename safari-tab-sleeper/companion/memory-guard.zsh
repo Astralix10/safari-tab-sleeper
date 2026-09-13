@@ -1,11 +1,13 @@
 #!/bin/zsh
 set -euo pipefail
+setopt extendedglob
 
 SCRIPT_DIR="${0:A:h}"
 THRESHOLD_GB="3"
 ALERT_THRESHOLD_GB="5"
 INTERVAL_SECONDS="60"
 COOLDOWN_SECONDS="600"
+CLEANUP_COOLDOWN_SECONDS="300"
 SAMPLE_FILE=""
 SWAP_SAMPLE_FILE=""
 ONCE="0"
@@ -13,6 +15,13 @@ DRY_RUN="0"
 AUTO_SLEEP_PRESSURE_DOMAINS="1"
 PAUSE_FILE="$SCRIPT_DIR/pause-until"
 SETTINGS_READY_FILE="$SCRIPT_DIR/settings-ready"
+SLEEP_SERVER_URL="${SAFARI_TAB_SLEEPER_SLEEP_URL:-http://127.0.0.1:17654/sleep}"
+SLEEP_SERVER_HEALTH_URL="${SAFARI_TAB_SLEEPER_HEALTH_URL:-${SLEEP_SERVER_URL%/sleep}/health}"
+SLEEP_SERVER_SCRIPT="$SCRIPT_DIR/sleeper-server.py"
+SLEEP_SERVER_LOG="$HOME/Library/Logs/safari-tab-sleeper-server.log"
+SLEEP_SERVER_ERROR_LOG="$HOME/Library/Logs/safari-tab-sleeper-server.err.log"
+PYTHON_BIN="${SAFARI_TAB_SLEEPER_PYTHON:-/usr/bin/python3}"
+MUTATION_TOKEN_FILE="${SAFARI_TAB_SLEEPER_TOKEN_FILE:-$SCRIPT_DIR/companion-token}"
 
 usage() {
   cat <<'EOF'
@@ -24,6 +33,8 @@ Options:
                      Порог пользовательских окон/уведомлений в ГБ. По умолчанию: 5
   --interval N       Интервал проверки в секундах. По умолчанию: 60
   --cooldown N       Минимальная пауза между диалогами. По умолчанию: 600
+  --cleanup-cooldown N
+                     Минимальная пауза между автоочистками. По умолчанию: 300
   --sample FILE      Читать sample ps вместо живого списка процессов.
   --swap-sample FILE Читать sample sysctl vm.swapusage вместо живого swap.
   --no-auto-pressure Не усыплять тяжёлые фоновые вкладки автоматически.
@@ -34,29 +45,52 @@ Options:
 EOF
 }
 
+fail_argument() {
+  print -- "Ошибка аргумента: $1" >&2
+  usage >&2
+  exit 2
+}
+
+require_option_value() {
+  local option_name="$1"
+  local option_value="${2-}"
+  [[ -n "$option_value" ]] || fail_argument "$option_name требует значение"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --threshold-gb)
+      require_option_value "$1" "${2-}"
       THRESHOLD_GB="$2"
       shift 2
       ;;
     --alert-threshold-gb)
+      require_option_value "$1" "${2-}"
       ALERT_THRESHOLD_GB="$2"
       shift 2
       ;;
     --interval)
+      require_option_value "$1" "${2-}"
       INTERVAL_SECONDS="$2"
       shift 2
       ;;
     --cooldown)
+      require_option_value "$1" "${2-}"
       COOLDOWN_SECONDS="$2"
       shift 2
       ;;
+    --cleanup-cooldown)
+      require_option_value "$1" "${2-}"
+      CLEANUP_COOLDOWN_SECONDS="$2"
+      shift 2
+      ;;
     --sample)
+      require_option_value "$1" "${2-}"
       SAMPLE_FILE="$2"
       shift 2
       ;;
     --swap-sample)
+      require_option_value "$1" "${2-}"
       SWAP_SAMPLE_FILE="$2"
       shift 2
       ;;
@@ -83,6 +117,29 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+is_positive_number() {
+  local value="$1"
+  [[ "$value" == <-> || "$value" == <->.<-> ]] || return 1
+  awk -v value="$value" 'BEGIN { exit !(value > 0) }'
+}
+
+is_positive_integer() {
+  local value="$1"
+  [[ "$value" == <-> ]] || return 1
+  (( 10#$value > 0 ))
+}
+
+is_nonnegative_integer() {
+  local value="$1"
+  [[ "$value" == <-> ]]
+}
+
+is_positive_number "$THRESHOLD_GB" || fail_argument "--threshold-gb должен быть числом больше нуля"
+is_positive_number "$ALERT_THRESHOLD_GB" || fail_argument "--alert-threshold-gb должен быть числом больше нуля"
+is_positive_integer "$INTERVAL_SECONDS" || fail_argument "--interval должен быть целым числом больше нуля"
+is_nonnegative_integer "$COOLDOWN_SECONDS" || fail_argument "--cooldown должен быть целым неотрицательным числом"
+is_nonnegative_integer "$CLEANUP_COOLDOWN_SECONDS" || fail_argument "--cleanup-cooldown должен быть целым неотрицательным числом"
 
 collect_processes() {
   if [[ -n "$SAMPLE_FILE" ]]; then
@@ -126,7 +183,7 @@ measure_memory() {
   swap_used_mb="$(measure_swap_mb)"
 
   collect_processes | awk -v threshold_kb="$threshold_kb" -v alert_threshold_kb="$alert_threshold_kb" -v swap_used_mb="$swap_used_mb" '
-    /Safari|WebKit|com\.apple\.WebKit/ {
+    {
       pid=$1
       rss=$2
       if (rss !~ /^[0-9]+$/) next
@@ -134,7 +191,13 @@ measure_memory() {
       for (i=3; i<=NF; i++) {
         command = command (i == 3 ? "" : " ") $i
       }
-      if (command ~ /memory-guard\.zsh/) next
+      safari_process = command ~ /^\/Applications\/Safari\.app\/Contents\/MacOS\/Safari([[:space:]]|$)/ \
+        || command ~ /^\/Applications\/Safari Technology Preview\.app\/Contents\/MacOS\/Safari Technology Preview([[:space:]]|$)/ \
+        || command ~ /^\/System\/Applications\/Safari\.app\/Contents\/MacOS\/Safari([[:space:]]|$)/ \
+        || command ~ /^\/System\/Volumes\/Preboot\/Cryptexes\/App\/System\/Applications\/Safari\.app\/Contents\/MacOS\/Safari([[:space:]]|$)/ \
+        || command ~ /^\/System\/Volumes\/Preboot\/Cryptexes\/App\/System\/Library\/StagedFrameworks\/Safari\/.*\/com\.apple\.WebKit\.(WebContent|GPU|Networking)([[:space:]]|$)/ \
+        || command ~ /^\/System\/Library\/.*\/com\.apple\.WebKit\.(WebContent|GPU|Networking)([[:space:]]|$)/
+      if (!safari_process) next
       total += rss
       if (rss > max) {
         max = rss
@@ -145,8 +208,8 @@ measure_memory() {
     END {
       total_mb = int(total / 1024 + 0.5)
       max_mb = int(max / 1024 + 0.5)
-      over = (total >= threshold_kb || max >= threshold_kb || swap_used_mb * 1024 >= threshold_kb) ? 1 : 0
-      over_alert = (total >= alert_threshold_kb || max >= alert_threshold_kb || swap_used_mb * 1024 >= alert_threshold_kb) ? 1 : 0
+      over = (total >= threshold_kb || max >= threshold_kb) ? 1 : 0
+      over_alert = (total >= alert_threshold_kb || max >= alert_threshold_kb) ? 1 : 0
       printf "total_mb=%d max_mb=%d swap_used_mb=%d over_threshold=%d over_alert=%d top_pid=%s top_command=%s\n", total_mb, max_mb, swap_used_mb, over, over_alert, top_pid, top_command
     }
   '
@@ -178,6 +241,75 @@ pause_remaining_seconds() {
 
 settings_are_synced() {
   [[ -f "$SETTINGS_READY_FILE" ]]
+}
+
+sleep_server_is_healthy() {
+  /usr/bin/curl --silent --fail --max-time 1 "$SLEEP_SERVER_HEALTH_URL" >/dev/null 2>&1
+}
+
+rotate_log_if_needed() {
+  local log_file="$1"
+  local max_bytes="${2:-2097152}"
+  local size
+  [[ -f "$log_file" ]] || return 0
+  size="$(wc -c < "$log_file" | tr -d ' ')"
+  if [[ "$size" == <-> && "$size" -gt "$max_bytes" ]]; then
+    tail -c "$max_bytes" "$log_file" > "$log_file.1"
+    : > "$log_file"
+  fi
+}
+
+ensure_sleep_server() {
+  if sleep_server_is_healthy; then
+    return 0
+  fi
+
+  if [[ ! -x "$PYTHON_BIN" || ! -f "$SLEEP_SERVER_SCRIPT" ]]; then
+    print "Safari Tab Sleeper: не найден Python или sleeper-server.py" >&2
+    return 1
+  fi
+
+  local mutation_token
+  mutation_token="$(cat "$MUTATION_TOKEN_FILE" 2>/dev/null || true)"
+  if [[ "$mutation_token" != [0-9a-f]## || ${#mutation_token} -ne 64 ]]; then
+    print "Safari Tab Sleeper: отсутствует корректный companion token" >&2
+    return 1
+  fi
+
+  rotate_log_if_needed "$SLEEP_SERVER_LOG"
+  rotate_log_if_needed "$SLEEP_SERVER_ERROR_LOG"
+  SAFARI_TAB_SLEEPER_MUTATION_TOKEN="$mutation_token" \
+    "$PYTHON_BIN" "$SLEEP_SERVER_SCRIPT" </dev/null >>"$SLEEP_SERVER_LOG" 2>>"$SLEEP_SERVER_ERROR_LOG" &!
+
+  local attempt
+  for attempt in {1..20}; do
+    sleep 0.1
+    if sleep_server_is_healthy; then
+      return 0
+    fi
+  done
+
+  print "Safari Tab Sleeper: сервер не запустился на $SLEEP_SERVER_HEALTH_URL" >&2
+  return 1
+}
+
+sleep_with_server_watchdog() {
+  local remaining="$1"
+  local step
+
+  while (( remaining > 0 )); do
+    step=5
+    if (( remaining < step )); then
+      step="$remaining"
+    fi
+
+    sleep "$step"
+    remaining=$(( remaining - step ))
+
+    if [[ "$DRY_RUN" != "1" ]]; then
+      ensure_sleep_server || true
+    fi
+  done
 }
 
 show_memory_alert_notification() {
@@ -215,17 +347,42 @@ APPLESCRIPT
 }
 
 sleep_inactive_pressure_tabs() {
+  local total_mb="${1:-0}"
+  local max_mb="${2:-0}"
   if ! settings_are_synced; then
-    print "slept_count=0 settings_pending=1"
+    print "queued=0 settings_pending=1"
     return 0
   fi
 
-  osascript "$SCRIPT_DIR/sleep-inactive-youtube-tabs.applescript" "$SCRIPT_DIR/local-sleeper.html" "$SCRIPT_DIR/allowlist.txt" 2>/dev/null || true
+  local mutation_token
+  mutation_token="$(cat "$MUTATION_TOKEN_FILE" 2>/dev/null || true)"
+  if [[ -z "$mutation_token" ]]; then
+    print "queued=0 token_missing=1"
+    return 0
+  fi
+
+  local response
+  response="$(/usr/bin/curl --silent --fail --max-time 2 \
+    -H "Content-Type: application/json" \
+    -H "X-Safari-Tab-Sleeper-Token: $mutation_token" \
+    -H "X-Safari-Tab-Sleeper-Native: 1" \
+    --data "{\"action\":\"queue\",\"totalMb\":$total_mb,\"maxMb\":$max_mb}" \
+    "${SLEEP_SERVER_URL%/sleep}/cleanup-request" 2>/dev/null || true)"
+  if [[ "$response" == *'"queued": true'* ]]; then
+    print "queued=1"
+  else
+    print "queued=0"
+  fi
 }
 
 LAST_ALERT_AT="0"
+LAST_CLEANUP_AT="0"
 
 while true; do
+  if [[ "$DRY_RUN" != "1" ]]; then
+    ensure_sleep_server || true
+  fi
+
   line="$(measure_memory)"
 
   if [[ "$DRY_RUN" == "1" ]]; then
@@ -245,33 +402,17 @@ while true; do
     if [[ "$ONCE" == "1" ]]; then
       exit 0
     fi
-    sleep "$INTERVAL_SECONDS"
+    sleep_with_server_watchdog "$INTERVAL_SECONDS"
     continue
   fi
 
   if [[ "$DRY_RUN" != "1" && "$over_threshold" == "1" ]]; then
     pressure_result=""
-    if [[ "$AUTO_SLEEP_PRESSURE_DOMAINS" == "1" ]]; then
-      pressure_result="$(sleep_inactive_pressure_tabs)"
-      print -- "$(date '+%Y-%m-%d %H:%M:%S') pressure cleanup: $pressure_result"
-      slept_count="$(field_from_line "$pressure_result" "slept_count")"
-      slept_count="${slept_count:-0}"
-      if [[ "$slept_count" == "0" ]]; then
-        :
-      else
-        sleep 2
-        after_line="$(measure_memory)"
-        after_total_mb="$(field_from_line "$after_line" "total_mb")"
-        after_swap_used_mb="$(field_from_line "$after_line" "swap_used_mb")"
-        if [[ "$over_alert" == "1" && $(( now - LAST_ALERT_AT )) -ge "$COOLDOWN_SECONDS" ]]; then
-          show_cleanup_summary "$slept_count" "$total_mb" "${after_total_mb:-$total_mb}" "$swap_used_mb" "${after_swap_used_mb:-$swap_used_mb}"
-          LAST_ALERT_AT="$now"
-        fi
-        if [[ "$ONCE" == "1" ]]; then
-          exit 0
-        fi
-        sleep "$INTERVAL_SECONDS"
-        continue
+    if [[ "$AUTO_SLEEP_PRESSURE_DOMAINS" == "1" && $(( now - LAST_CLEANUP_AT )) -ge "$CLEANUP_COOLDOWN_SECONDS" ]]; then
+      LAST_CLEANUP_AT="$now"
+      pressure_result="$(sleep_inactive_pressure_tabs "$total_mb" "$max_mb")"
+      if [[ "$pressure_result" == *"queued=1"* ]]; then
+        print -- "$(date '+%Y-%m-%d %H:%M:%S') pressure cleanup requested: $pressure_result"
       fi
     fi
 
@@ -285,5 +426,5 @@ while true; do
     exit 0
   fi
 
-  sleep "$INTERVAL_SECONDS"
+  sleep_with_server_watchdog "$INTERVAL_SECONDS"
 done

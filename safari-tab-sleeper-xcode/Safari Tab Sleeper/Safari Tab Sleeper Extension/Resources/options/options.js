@@ -12,6 +12,7 @@ async function send(type, payload = {}) {
 function fillForm(settings) {
   form.profile.value = settings.profile ?? DEFAULT_SETTINGS.profile;
   form.inactivityMinutes.value = settings.inactivityMinutes;
+  form.inactivityMinutes.disabled = settings.profile === 'aggressive';
   form.youtubeVideoThreshold.value = settings.youtubeVideoThreshold;
   form.youtubeHighRiskInactiveSeconds.value = settings.youtubeHighRiskInactiveSeconds;
   form.aggressiveInactiveSeconds.value = settings.aggressiveInactiveSeconds;
@@ -27,12 +28,17 @@ function fillForm(settings) {
 }
 
 function readForm() {
+  const numberOrDefault = (field, fallback) => {
+    const rawValue = String(field.value ?? '').trim();
+    const value = Number(rawValue);
+    return rawValue && Number.isFinite(value) ? value : fallback;
+  };
   return {
     profile: form.profile.value,
-    inactivityMinutes: Number(form.inactivityMinutes.value),
-    youtubeVideoThreshold: Number(form.youtubeVideoThreshold.value),
-    youtubeHighRiskInactiveSeconds: Number(form.youtubeHighRiskInactiveSeconds.value),
-    aggressiveInactiveSeconds: Number(form.aggressiveInactiveSeconds.value),
+    inactivityMinutes: numberOrDefault(form.inactivityMinutes, DEFAULT_SETTINGS.inactivityMinutes),
+    youtubeVideoThreshold: numberOrDefault(form.youtubeVideoThreshold, DEFAULT_SETTINGS.youtubeVideoThreshold),
+    youtubeHighRiskInactiveSeconds: numberOrDefault(form.youtubeHighRiskInactiveSeconds, DEFAULT_SETTINGS.youtubeHighRiskInactiveSeconds),
+    aggressiveInactiveSeconds: numberOrDefault(form.aggressiveInactiveSeconds, DEFAULT_SETTINGS.aggressiveInactiveSeconds),
     restoreOnFocus: form.restoreOnFocus.checked,
     powerAware: form.powerAware.checked,
     requireLocalSleepServer: form.requireLocalSleepServer.checked,
@@ -46,17 +52,30 @@ function readForm() {
 }
 
 async function load() {
-  fillForm(await send('tab-sleeper:get-settings'));
+  try {
+    fillForm(await send('tab-sleeper:get-settings'));
+  } catch (error) {
+    fillForm(DEFAULT_SETTINGS);
+    status.textContent = `Не удалось загрузить настройки: ${String(error?.message ?? error)}`;
+  }
 }
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   status.textContent = 'Сохраняю...';
-  await send('tab-sleeper:save-settings', { settings: readForm() });
-  status.textContent = 'Сохранено.';
-  setTimeout(() => {
-    status.textContent = '';
-  }, 1800);
+  try {
+    const result = await send('tab-sleeper:save-settings', { settings: readForm() });
+    if (result?.ok === false) {
+      throw new Error(result.reason || 'save-failed');
+    }
+    fillForm(await send('tab-sleeper:get-settings'));
+    status.textContent = 'Сохранено.';
+    setTimeout(() => {
+      status.textContent = '';
+    }, 1800);
+  } catch (error) {
+    status.textContent = `Не удалось сохранить: ${String(error?.message ?? error)}`;
+  }
 });
 
 restoreDefaults.addEventListener('click', () => {
@@ -70,4 +89,4 @@ form.profile.addEventListener('change', () => {
   });
 });
 
-load();
+void load();

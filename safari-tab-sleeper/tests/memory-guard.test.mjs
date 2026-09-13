@@ -16,6 +16,7 @@ test('memory guard parses aggregate and max process RSS from ps-like input', asy
     '102 4200000 /System/Library/Frameworks/WebKit.framework/com.apple.WebKit.WebContent',
     '103 900000 /usr/libexec/OtherProcess',
     '104 6400000 /System/Library/Frameworks/WebKit.framework/com.apple.WebKit.WebContent',
+    '105 9000000 /Users/test/Library/Application Support/Safari Tab Sleeper/sleeper-server.py',
   ].join('\n'));
 
   const { stdout } = await execFileAsync('zsh', [
@@ -101,7 +102,7 @@ test('memory guard shows user alerts only after 5 GB by default', async () => {
   assert.match(high.stdout, /over_alert=1/);
 });
 
-test('memory guard treats swap pressure as over threshold even when Safari RSS is low', async () => {
+test('memory guard reports system swap without attributing it to Safari', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'safari-tab-sleeper-'));
   const psSample = join(dir, 'ps.txt');
   const swapSample = join(dir, 'swap.txt');
@@ -125,7 +126,8 @@ test('memory guard treats swap pressure as over threshold even when Safari RSS i
 
   assert.match(stdout, /total_mb=488/);
   assert.match(stdout, /swap_used_mb=4096/);
-  assert.match(stdout, /over_threshold=1/);
+  assert.match(stdout, /over_threshold=0/);
+  assert.match(stdout, /over_alert=0/);
 });
 
 test('memory guard uses notification center instead of modal dialogs', async () => {
@@ -141,4 +143,44 @@ test('memory guard waits for extension settings sync before pressure sleeping', 
   assert.equal(script.includes('settings-ready'), true);
   assert.equal(script.includes('settings_are_synced()'), true);
   assert.equal(script.includes('settings_pending=1'), true);
+});
+
+test('memory guard self-heals the localhost sleep server', async () => {
+  const [memoryGuard, installer] = await Promise.all([
+    readFile(new URL('../companion/memory-guard.zsh', import.meta.url), 'utf8'),
+    readFile(new URL('../companion/install-launch-agent.zsh', import.meta.url), 'utf8'),
+  ]);
+
+  assert.equal(memoryGuard.includes('ensure_sleep_server()'), true);
+  assert.equal(memoryGuard.includes('sleep_server_is_healthy()'), true);
+  assert.equal(memoryGuard.includes('ensure_sleep_server || true'), true);
+  assert.equal(memoryGuard.includes('sleep_with_server_watchdog()'), true);
+  assert.equal(memoryGuard.includes('step=5'), true);
+  assert.equal(installer.includes('launchctl bootstrap "gui/$(id -u)" "$SERVER_PLIST"'), false);
+  assert.equal(installer.includes('rm -f "$SERVER_PLIST"'), true);
+});
+
+test('memory guard rejects malformed numeric arguments before measuring processes', async () => {
+  for (const args of [
+    ['--threshold-gb', 'abc'],
+    ['--threshold-gb', '-1'],
+    ['--interval', '1.5'],
+    ['--cooldown', '-5'],
+    ['--cleanup-cooldown', 'nope'],
+  ]) {
+    await assert.rejects(
+      execFileAsync('zsh', ['companion/memory-guard.zsh', ...args, '--once', '--dry-run'], {
+        cwd: new URL('..', import.meta.url),
+      }),
+      (error) => error.code === 2 && /Ошибка аргумента/.test(error.stderr),
+    );
+  }
+});
+
+test('memory guard rotates oversized companion server logs before restart', async () => {
+  const script = await readFile(new URL('../companion/memory-guard.zsh', import.meta.url), 'utf8');
+
+  assert.equal(script.includes('rotate_log_if_needed()'), true);
+  assert.equal(script.includes('2097152'), true);
+  assert.equal(script.includes('rotate_log_if_needed "$SLEEP_SERVER_ERROR_LOG"'), true);
 });

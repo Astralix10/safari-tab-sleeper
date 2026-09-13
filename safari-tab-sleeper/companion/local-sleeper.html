@@ -107,15 +107,7 @@
     }
 
     function getSleepingTabIconUrl(pageUrl) {
-      try {
-        const parsed = new URL(normalizeRestorableUrl(pageUrl) || pageUrl);
-        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-          return '';
-        }
-        return `${parsed.origin}/favicon.ico`;
-      } catch {
-        return '';
-      }
+      return '';
     }
 
     function decodeURIComponentSafely(value) {
@@ -124,6 +116,44 @@
       } catch {
         return value;
       }
+    }
+
+    function decodeFallbackEntry(encoded) {
+      try {
+        if (!encoded) return null;
+        const padded = encoded.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(encoded.length / 4) * 4, '=');
+        const binary = atob(padded);
+        const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+        return JSON.parse(new TextDecoder().decode(bytes));
+      } catch {
+        return null;
+      }
+    }
+
+    function unwrapSleepUrl(value) {
+      let current = String(value || '').trim();
+      const seen = new Set();
+      for (let depth = 0; depth < 8 && current && !seen.has(current); depth += 1) {
+        seen.add(current);
+        try {
+          const parsed = new URL(current);
+          const protocol = parsed.protocol.toLowerCase();
+          const path = parsed.pathname.toLowerCase();
+          const host = parsed.hostname.toLowerCase();
+          const isWrapper = (protocol === 'file:' && path.endsWith('/local-sleeper.html'))
+            || ((host === '127.0.0.1' || host === 'localhost') && path === '/sleep')
+            || (protocol.includes('extension:') && path.endsWith('/sleep/sleep.html'));
+          if (!isWrapper) break;
+          const sleepParams = new URLSearchParams(parsed.hash.slice(1));
+          const fallback = decodeFallbackEntry(sleepParams.get('fallback'));
+          const next = sleepParams.get('url') || fallback?.url || '';
+          if (!next) break;
+          current = next;
+        } catch {
+          break;
+        }
+      }
+      return current;
     }
 
     function normalizeRestorableUrl(value) {
@@ -135,8 +165,9 @@
         }
       };
 
-      add(value);
-      let decoded = String(value || '').trim();
+      const unwrapped = unwrapSleepUrl(value);
+      add(unwrapped);
+      let decoded = unwrapped;
       for (let i = 0; i < 3; i += 1) {
         const next = decodeURIComponentSafely(decoded);
         if (next === decoded) break;
